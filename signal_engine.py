@@ -16,6 +16,7 @@ from colorama import Fore, Style, init
 
 from config import Config
 from oracle import LATEST_PRICES
+import orderbook_cache as clob_cache
 from orderbook_cache import validate_liquidity
 from scanner import get_active_markets, prune_expired_markets
 
@@ -141,7 +142,7 @@ def _evaluate_market(market: dict) -> dict | None:
     risk_multiplier = 1.0 + (token_price * 0.4)
     base = Config.BASE_GAP_BPS / 10000.0
     dynamic_need_pct: float = base * risk_multiplier
-    dynamic_need_pct = max(0.0006, min(dynamic_need_pct, 0.0012))
+    dynamic_need_pct = max(Config.MIN_DYNAMIC_NEED_PCT, min(dynamic_need_pct, Config.MAX_DYNAMIC_NEED_PCT))
 
     c1 = abs(move_pct) > dynamic_need_pct
     c2 = 0 < t_left_s <= Config.MAX_EXECUTION_TIME_SECONDS
@@ -271,7 +272,7 @@ def _print_diagnostics(markets: dict) -> None:
             risk_multiplier = 1.0 + (token_price * 0.4)
             base = Config.BASE_GAP_BPS / 10000.0
             dynamic_need_pct: float = base * risk_multiplier
-            dynamic_need_pct = max(0.0006, min(dynamic_need_pct, 0.0012))
+            dynamic_need_pct = max(Config.MIN_DYNAMIC_NEED_PCT, min(dynamic_need_pct, Config.MAX_DYNAMIC_NEED_PCT))
 
             c1 = abs(move) > dynamic_need_pct
             c2 = 0 < t_left_s <= Config.MAX_EXECUTION_TIME_SECONDS
@@ -308,6 +309,12 @@ def _print_diagnostics(markets: dict) -> None:
 
 async def _evaluate_once(markets: dict) -> int:
     """One evaluation pass. Returns signals generated."""
+    # ── Stale Cache Guard ────────────────────────────────────────────────────
+    # If the WebSocket is not live, the order book may be a frozen REST snapshot.
+    # Never generate a signal against stale data.
+    if not clob_cache.is_connected():
+        return 0
+    # ─────────────────────────────────────────────────────────────────────────
     generated = 0
     generated_this_pass: set[str] = set()
     for market in markets.values():
@@ -336,6 +343,19 @@ async def run_signal_engine() -> None:
 
     while True:
         try:
+            # ── Stale Cache Guard ────────────────────────────────────────────
+            # Hard gate: the WebSocket MUST be live before any evaluation runs.
+            # If WS has dropped, the order book cache may be a frozen REST
+            # snapshot — trading on it would be the "Stale Cache Trap".
+            if not clob_cache.is_connected():
+                print(
+                    f"{Fore.RED}[SIGNAL] ⚠️  WS DISCONNECTED — cache may be stale. "
+                    f"All signal evaluation BLOCKED until reconnect."
+                )
+                await asyncio.sleep(EVAL_INTERVAL_SECONDS)
+                continue
+            # ─────────────────────────────────────────────────────────────────
+
             _maybe_clear_signaled_markets()
             prune_expired_markets()
             markets = get_active_markets()

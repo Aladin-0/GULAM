@@ -1,19 +1,29 @@
-# ============================================================
-# SECURITY — NEVER COMMIT SECRETS
-# ============================================================
+# =============================================================
+# Gulam — Polymarket Bot .gitignore
+# =============================================================
+
+# !! SECRETS — NEVER COMMIT !!
 .env
 .env.*
-*.env
-secrets.json
+*.pem
+*.key
 
-# ============================================================
+# !! BOT STATE — runtime data, not source !!
+bot_state.db
+bot_state.db-shm
+bot_state.db-wal
+
 # Python
-# ============================================================
 __pycache__/
 *.py[cod]
-*$py.class
 *.pyo
 *.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
 
 # Virtual environments
 .venv/
@@ -21,32 +31,21 @@ venv/
 env/
 ENV/
 
-# Distribution / packaging
-dist/
-build/
-*.egg-info/
-*.egg
-
-# Pytest / coverage
-.pytest_cache/
-.coverage
-htmlcov/
-coverage.xml
-
-# ============================================================
-# Runtime / logs
-# ============================================================
-*.log
-bot_state.json
-*.sqlite
-*.db
-
-# ============================================================
-# IDE / OS
-# ============================================================
+# IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+
+# OS
 .DS_Store
 Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Coverage / testing
+.coverage
+htmlcov/
+.pytest_cache/

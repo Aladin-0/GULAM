@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+import time
 from datetime import datetime, timezone
 
 import aiohttp
@@ -20,6 +21,8 @@ INTERVAL_SECONDS = 900          # 15 minutes
 REFRESH_INTERVAL_SECONDS = 30
 RETRY_WAIT_SECONDS = 10
 MAX_TIME_REMAINING_MINUTES = 30  # accept current + next upcoming market
+SLUG_FETCH_RETRIES = 3          # max per-slug retry attempts
+SLUG_FETCH_BASE_DELAY = 1.0     # seconds — doubles on each retry (1s, 2s, 4s)
 
 ACTIVE_MARKETS: dict[str, dict] = {}
 
@@ -160,12 +163,59 @@ def _parse_market(raw: dict, symbol: str, slug: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 async def _fetch_slug(session: aiohttp.ClientSession, slug: str) -> dict | None:
-    """GET /markets?slug={slug} and return first result or None."""
-    async with session.get(GAMMA_MARKET_URL, params={"slug": slug}) as resp:
-        resp.raise_for_status()
-        data = await resp.json()
-    if isinstance(data, list) and data:
-        return data[0]
+    """GET /markets?slug={slug} with exponential backoff on transient errors."""
+    delay = SLUG_FETCH_BASE_DELAY
+    for attempt in range(1, SLUG_FETCH_RETRIES + 1):
+        try:
+            async with session.get(
+                GAMMA_MARKET_URL,
+                params={"slug": slug},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status == 429:  # rate-limited
+                    retry_after = float(resp.headers.get("Retry-After", delay))
+                    print(
+                        f"{Fore.YELLOW}[SCANNER] Rate-limited on {slug} "
+                        f"— waiting {retry_after:.1f}s (attempt {attempt}/{SLUG_FETCH_RETRIES})"
+                    )
+                    await asyncio.sleep(retry_after)
+                    delay *= 2
+                    continue
+                if resp.status >= 500:  # server error — backoff & retry
+                    print(
+                        f"{Fore.YELLOW}[SCANNER] HTTP {resp.status} on {slug} "
+                        f"— retrying in {delay:.1f}s (attempt {attempt}/{SLUG_FETCH_RETRIES})"
+                    )
+                    await asyncio.sleep(delay)
+                    delay *= 2
+                    continue
+                resp.raise_for_status()
+                data = await resp.json()
+            if isinstance(data, list) and data:
+                return data[0]
+            return None
+        except aiohttp.ClientResponseError as exc:
+            print(
+                f"{Fore.RED}[SCANNER] HTTP error {exc.status} on {slug}: {exc.message} "
+                f"— retrying in {delay:.1f}s (attempt {attempt}/{SLUG_FETCH_RETRIES})"
+            )
+            await asyncio.sleep(delay)
+            delay *= 2
+        except (aiohttp.ClientConnectorError, aiohttp.ServerDisconnectedError) as exc:
+            print(
+                f"{Fore.RED}[SCANNER] Connection error on {slug}: {exc} "
+                f"— retrying in {delay:.1f}s (attempt {attempt}/{SLUG_FETCH_RETRIES})"
+            )
+            await asyncio.sleep(delay)
+            delay *= 2
+        except asyncio.TimeoutError:
+            print(
+                f"{Fore.RED}[SCANNER] Timeout fetching {slug} "
+                f"— retrying in {delay:.1f}s (attempt {attempt}/{SLUG_FETCH_RETRIES})"
+            )
+            await asyncio.sleep(delay)
+            delay *= 2
+    print(f"{Fore.RED}[SCANNER] FAILED all {SLUG_FETCH_RETRIES} attempts for {slug} — skipping.")
     return None
 
 
@@ -181,11 +231,7 @@ async def _refresh_once(session: aiohttp.ClientSession) -> None:
     updated: dict[str, dict] = {}
 
     for asset, slug in slugs:
-        try:
-            raw = await _fetch_slug(session, slug)
-        except aiohttp.ClientError:
-            continue
-
+        raw = await _fetch_slug(session, slug)  # retries + backoff handled inside
         if raw is None:
             continue
 

@@ -1,9 +1,17 @@
 # paper_trader.py
-"""Paper trader: simulates trade execution against real market data, zero real money."""
+"""Paper trader: simulates trade execution against real market data, zero real money.
+
+State persistence: open positions and performance metrics are written to SQLite
+on every mutation. On restart, state is fully recovered from disk so no position
+is ever silently orphaned.
+"""
 
 import asyncio
+import json
+import sqlite3
 import time
 from datetime import date
+from pathlib import Path
 
 import aiohttp
 from colorama import Fore, Style, init
@@ -21,31 +29,162 @@ init(autoreset=True)
 
 MONITOR_INTERVAL_SECONDS = 5
 SUMMARY_INTERVAL_SECONDS = 300     # 5 minutes
-MAX_POSITION_AGE_SECONDS = 900     # force-close after 15 minutes unresolved
 
 # ---------------------------------------------------------------------------
-# Paper trading state
+# SQLite persistence layer
 # ---------------------------------------------------------------------------
 
-PAPER_STATE: dict = {
-    "capital": Config.INITIAL_CAPITAL,
-    "available_capital": Config.INITIAL_CAPITAL,
-    "total_profit": 0.0,
-    "total_trades": 0,
-    "winning_trades": 0,
-    "losing_trades": 0,
-    "loss_count": 0,
-    "total_lost_usd": 0.0,
-    "daily_profit": 0.0,
-    "daily_trades": 0,
-    "open_positions": {},
-    "trade_history": [],
-}
+_DB_PATH = Path("bot_state.db")
+_db_conn: sqlite3.Connection | None = None
+
+
+def _get_db() -> sqlite3.Connection:
+    """Return (and lazily create) the SQLite connection."""
+    global _db_conn
+    if _db_conn is None:
+        _db_conn = sqlite3.connect(_DB_PATH, check_same_thread=False)
+        _db_conn.row_factory = sqlite3.Row
+        _init_db(_db_conn)
+    return _db_conn
+
+
+def _init_db(conn: sqlite3.Connection) -> None:
+    """Create tables if they do not exist."""
+    # WAL mode: reads never block writes; NORMAL sync: fsync only on checkpoint
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS paper_state (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS open_positions (
+            condition_id TEXT PRIMARY KEY,
+            data         TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS trade_history (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            condition_id TEXT NOT NULL,
+            data         TEXT NOT NULL,
+            exit_time    REAL NOT NULL
+        );
+    """)
+    conn.commit()
+
+
+def _save_scalar(key: str, value) -> None:
+    """Upsert a single scalar value into paper_state."""
+    conn = _get_db()
+    conn.execute(
+        "INSERT INTO paper_state(key, value) VALUES(?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, json.dumps(value)),
+    )
+    conn.commit()
+
+
+def _load_scalar(key: str, default):
+    """Load a scalar from paper_state, returning default if absent."""
+    conn = _get_db()
+    row = conn.execute("SELECT value FROM paper_state WHERE key=?", (key,)).fetchone()
+    return json.loads(row["value"]) if row else default
+
+
+def _save_position(condition_id: str, position: dict) -> None:
+    conn = _get_db()
+    conn.execute(
+        "INSERT INTO open_positions(condition_id, data) VALUES(?,?) "
+        "ON CONFLICT(condition_id) DO UPDATE SET data=excluded.data",
+        (condition_id, json.dumps(position)),
+    )
+    conn.commit()
+
+
+def _delete_position(condition_id: str) -> None:
+    conn = _get_db()
+    conn.execute("DELETE FROM open_positions WHERE condition_id=?", (condition_id,))
+    conn.commit()
+
+
+def _save_trade_record(record: dict) -> None:
+    conn = _get_db()
+    conn.execute(
+        "INSERT INTO trade_history(condition_id, data, exit_time) VALUES(?,?,?)",
+        (record["condition_id"], json.dumps(record), record["exit_time"]),
+    )
+    # Keep history table lean — keep last 500 rows
+    conn.execute(
+        "DELETE FROM trade_history WHERE id NOT IN "
+        "(SELECT id FROM trade_history ORDER BY id DESC LIMIT 500)"
+    )
+    conn.commit()
+
+
+def _load_all_positions() -> dict:
+    """Return all open positions from DB as {condition_id: dict}."""
+    conn = _get_db()
+    rows = conn.execute("SELECT condition_id, data FROM open_positions").fetchall()
+    return {row["condition_id"]: json.loads(row["data"]) for row in rows}
+
+
+def _persist_full_state() -> None:
+    """Write all mutable PAPER_STATE scalars to DB in one transaction."""
+    conn = _get_db()
+    scalars = {
+        "capital": PAPER_STATE["capital"],
+        "available_capital": PAPER_STATE["available_capital"],
+        "total_profit": PAPER_STATE["total_profit"],
+        "total_trades": PAPER_STATE["total_trades"],
+        "winning_trades": PAPER_STATE["winning_trades"],
+        "losing_trades": PAPER_STATE["losing_trades"],
+        "loss_count": PAPER_STATE["loss_count"],
+        "total_lost_usd": PAPER_STATE["total_lost_usd"],
+        "daily_profit": PAPER_STATE["daily_profit"],
+        "daily_trades": PAPER_STATE["daily_trades"],
+        "state_date": str(_today),
+    }
+    conn.executemany(
+        "INSERT INTO paper_state(key, value) VALUES(?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [(k, json.dumps(v)) for k, v in scalars.items()],
+    )
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Paper trading state — loaded from DB on startup
+# ---------------------------------------------------------------------------
+
+def _build_initial_state() -> dict:
+    """Bootstrap PAPER_STATE from DB (first run → use defaults)."""
+    return {
+        "capital": _load_scalar("capital", Config.INITIAL_CAPITAL),
+        "available_capital": _load_scalar("available_capital", Config.INITIAL_CAPITAL),
+        "total_profit": _load_scalar("total_profit", 0.0),
+        "total_trades": _load_scalar("total_trades", 0),
+        "winning_trades": _load_scalar("winning_trades", 0),
+        "losing_trades": _load_scalar("losing_trades", 0),
+        "loss_count": _load_scalar("loss_count", 0),
+        "total_lost_usd": _load_scalar("total_lost_usd", 0.0),
+        "daily_profit": _load_scalar("daily_profit", 0.0),
+        "daily_trades": _load_scalar("daily_trades", 0),
+        "open_positions": _load_all_positions(),
+        "trade_history": [],
+    }
+
+
+# Force DB init at import time so tables exist before any write
+_get_db()
+PAPER_STATE: dict = _build_initial_state()
 
 # Internal bookkeeping
-_last_processed_index: int = 0   # index into SIGNAL_HISTORY up to which we have acted
-_trading_halted: bool = False    # True when daily loss limit is hit
-_today: date = date.today()
+_last_processed_index: int = 0
+_trading_halted: bool = False
+_today: date = date.fromisoformat(
+    _load_scalar("state_date", str(date.today()))
+)
 _last_summary_ts: float = time.time()
 
 
@@ -96,6 +235,7 @@ def _maybe_daily_reset() -> None:
         PAPER_STATE["daily_profit"] = 0.0
         PAPER_STATE["daily_trades"] = 0
         _trading_halted = False
+        _persist_full_state()
         print(f"{Fore.CYAN}[PAPER] Midnight reset — daily counters cleared.")
 
 
@@ -127,7 +267,7 @@ def _open_position(signal: dict) -> None:
         p["cost"] for p in PAPER_STATE["open_positions"].values()
     )
     size = total_equity * Config.MAX_POSITION_SIZE_PCT
-    if size < 1.0:
+    if size < Config.MIN_ORDER_SIZE_USD:
         return  # not enough capital
 
     entry_price: float = signal["entry_price"]
@@ -154,6 +294,10 @@ def _open_position(signal: dict) -> None:
 
     PAPER_STATE["open_positions"][condition_id] = position
     PAPER_STATE["available_capital"] -= cost + Config.SIMULATED_GAS_FEE_USD
+
+    # --- Persist immediately ---
+    _save_position(condition_id, position)
+    _persist_full_state()
 
     print(
         f"{Fore.YELLOW}[PAPER] Position opened: "
@@ -185,8 +329,20 @@ def _close_position(condition_id: str, exit_price: float, reason: str) -> None:
         PAPER_STATE["available_capital"]
         + sum(p["cost"] for p in PAPER_STATE["open_positions"].values())
     )
-    PAPER_STATE["total_profit"] += net_profit
-    PAPER_STATE["daily_profit"] += net_profit
+
+    # ── P&L Accounting Identity ─────────────────────────────────────────────
+    # Use explicit branches so the dashboard ALWAYS moves in the correct
+    # direction: wins add a positive amount; losses subtract a positive amount.
+    # This eliminates any sign-confusion in the += operator path.
+    if is_win:
+        PAPER_STATE["total_profit"] += net_profit          # net_profit > 0
+        PAPER_STATE["daily_profit"] += net_profit          # net_profit > 0
+    else:
+        loss_magnitude = abs(net_profit)                   # always positive
+        PAPER_STATE["total_profit"] -= loss_magnitude      # guaranteed decrease
+        PAPER_STATE["daily_profit"] -= loss_magnitude      # guaranteed decrease
+    # ───────────────────────────────────────────────────────────────────
+
     PAPER_STATE["total_trades"] += 1
     PAPER_STATE["daily_trades"] += 1
 
@@ -217,6 +373,11 @@ def _close_position(condition_id: str, exit_price: float, reason: str) -> None:
     if len(PAPER_STATE["trade_history"]) > 100:
         del PAPER_STATE["trade_history"][0]
 
+    # --- Persist immediately: delete position, save trade, update scalars ---
+    _delete_position(condition_id)
+    _save_trade_record(trade_record)
+    _persist_full_state()
+
     color = Fore.GREEN if is_win else Fore.RED
     result = "WIN" if is_win else "LOSS"
     sym_label = f"{position['symbol'].upper()} {position['side']}"
@@ -227,7 +388,7 @@ def _close_position(condition_id: str, exit_price: float, reason: str) -> None:
     )
     print(
         f"{color}{Style.BRIGHT}[PAPER] SETTLED {result}: {sym_label} | "
-        f"entry={position['entry_price']:.2f} \u2192 resolved ${exit_price:.2f} | "
+        f"entry={position['entry_price']:.2f} → resolved ${exit_price:.2f} | "
         f"{pnl_str}"
     )
     print(
@@ -256,7 +417,7 @@ async def _fetch_resolution(slug: str) -> dict | None:
 
 
 async def _monitor_positions() -> None:
-    """Check open positions; exit on settlement, force-expire after 15min."""
+    """Check open positions; exit on settlement, force-expire after MAX_POSITION_AGE_SECONDS."""
     active_markets = get_active_markets()
     to_close: list[tuple[str, float, str]] = []
 
@@ -267,8 +428,8 @@ async def _monitor_positions() -> None:
     for condition_id, position in PAPER_STATE["open_positions"].items():
         elapsed = time.time() - position["entry_time"]
 
-        # --- Hard age limit: force-close after 15 minutes ---
-        if elapsed > MAX_POSITION_AGE_SECONDS:
+        # --- Hard age limit ---
+        if elapsed > Config.MAX_POSITION_AGE_SECONDS:
             sym = position.get("symbol", "?").upper()
             print(
                 f"{Fore.RED}[PAPER] FORCE EXPIRED: {sym} held "
@@ -290,6 +451,8 @@ async def _monitor_positions() -> None:
                     market.get("down_price", position.get("last_price", position["entry_price"]))
                 )
             position.pop("uncertain_resolve_at", None)
+            # Persist the updated last_price
+            _save_position(condition_id, position)
             continue
 
         # --- Market has disappeared — resolve using oracle vs PTB ---
@@ -303,7 +466,6 @@ async def _monitor_positions() -> None:
         uncertain_at: float | None = position.get("uncertain_resolve_at")
 
         if oracle_price == 0.0 or ptb == 0.0:
-            # Oracle not ready — defer resolution
             if uncertain_at is None:
                 print(
                     f"{Fore.YELLOW}[PAPER] {sym} {position['side']} "
@@ -311,8 +473,8 @@ async def _monitor_positions() -> None:
                     f"oracle/PTB unavailable → deferring 60s..."
                 )
                 position["uncertain_resolve_at"] = time.time() + 60
+                _save_position(condition_id, position)
             elif time.time() >= uncertain_at:
-                # Force-close after deferral with no oracle data
                 print(
                     f"{Fore.RED}[PAPER] {sym} {position['side']} "
                     f"(cid={cid_short}...) force-resolved (no oracle data) → LOSS"
@@ -330,14 +492,14 @@ async def _monitor_positions() -> None:
             print(
                 f"{Fore.GREEN}[PAPER] {sym} {position['side']} "
                 f"(cid={cid_short}...) market gone, "
-                f"oracle=${oracle_price:,.2f} vs PTB=${ptb:,.2f} \u2192 WIN"
+                f"oracle=${oracle_price:,.2f} vs PTB=${ptb:,.2f} → WIN"
             )
             to_close.append((condition_id, 1.0, "settled_win"))
         else:
             print(
                 f"{Fore.RED}[PAPER] {sym} {position['side']} "
                 f"(cid={cid_short}...) market gone, "
-                f"oracle=${oracle_price:,.2f} vs PTB=${ptb:,.2f} \u2192 LOSS"
+                f"oracle=${oracle_price:,.2f} vs PTB=${ptb:,.2f} → LOSS"
             )
             to_close.append((condition_id, 0.0, "settled_loss"))
 
@@ -361,6 +523,7 @@ def _print_performance_summary() -> None:
         f"{Fore.CYAN}  Losing trades : {summary['loss_count']}\n"
         f"{Fore.CYAN}  Total lost    : -${summary['total_lost_usd']:.2f}\n"
         f"{Fore.CYAN}  Open Positions: {summary['open_positions']}\n"
+        f"{Fore.CYAN}  State DB      : {_DB_PATH.resolve()}\n"
     )
 
 
@@ -376,18 +539,19 @@ async def run_paper_trader() -> None:
     """Monitor signals and positions continuously. Public coroutine for main.py."""
     global _last_processed_index, _last_summary_ts, _last_open_pos_ts
 
+    recovered = len(PAPER_STATE["open_positions"])
     print(
         f"{Fore.CYAN}[PAPER] Paper trader started — "
         f"capital=${PAPER_STATE['capital']:.2f}  "
-        f"paper_trading={Config.PAPER_TRADING}"
+        f"paper_trading={Config.PAPER_TRADING}  "
+        f"recovered={recovered} open position(s) from DB ({_DB_PATH})"
     )
 
-    # --- Force-close stale positions on startup ---
-    stale_ids = []
-    for cid, pos in PAPER_STATE["open_positions"].items():
-        elapsed = time.time() - pos["entry_time"]
-        if elapsed > 900:  # older than 15 minutes
-            stale_ids.append(cid)
+    # --- Force-close stale positions recovered from DB on startup ---
+    stale_ids = [
+        cid for cid, pos in PAPER_STATE["open_positions"].items()
+        if time.time() - pos["entry_time"] > Config.MAX_POSITION_AGE_SECONDS
+    ]
 
     for cid in stale_ids:
         pos = PAPER_STATE["open_positions"][cid]
@@ -439,7 +603,7 @@ async def run_paper_trader() -> None:
             # --- Daily loss limit check (always, even without new signal) ---
             _check_daily_loss_limit()
 
-            # --- Periodic performance summary every 10 minutes ---
+            # --- Periodic performance summary every 5 minutes ---
             if time.time() - _last_summary_ts >= SUMMARY_INTERVAL_SECONDS:
                 _print_performance_summary()
                 _last_summary_ts = time.time()

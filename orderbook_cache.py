@@ -31,10 +31,23 @@ _ORDERBOOKS: dict[str, dict] = defaultdict(lambda: {
 # Set of token IDs currently subscribed (managed by background worker)
 _SUBSCRIBED_TOKENS: set[str] = set()
 
+# Tracks whether the WebSocket is currently open and receiving data.
+# Set True only after a successful connect + subscription; False on any close/error.
+_WS_CONNECTED: bool = False
+
 
 # ---------------------------------------------------------------------------
 # Public helpers
 # ---------------------------------------------------------------------------
+
+def is_connected() -> bool:
+    """Return True ONLY if the WebSocket is actively open and receiving data.
+
+    Used by signal_engine as a strict gate: if this returns False, no signal
+    should ever be generated — the cache may be a frozen REST snapshot.
+    """
+    return _WS_CONNECTED
+
 
 def get_orderbook(token_id: str) -> dict | None:
     """Return the cached order book for a token_id, or None if not tracked."""
@@ -244,7 +257,12 @@ async def _ws_receive_loop(ws) -> None:
 
 async def _ws_worker() -> None:
     """Persistent WebSocket connection with auto-reconnect and dynamic subscriptions."""
-    global _SUBSCRIBED_TOKENS
+    global _SUBSCRIBED_TOKENS, _WS_CONNECTED
+
+    # Exponential backoff: 3s → 6s → 12s (capped at 12s)
+    _BACKOFF_BASE = 3
+    _BACKOFF_MAX = 12
+    reconnect_delay = _BACKOFF_BASE
 
     while True:
         # Determine target token IDs from current active markets
@@ -257,7 +275,11 @@ async def _ws_worker() -> None:
             print(
                 f"{Fore.GREEN}[ORDERBOOK] Connecting to Polymarket CLOB WS..."
             )
-            async with websockets.connect(CLOB_WS_URL, ping_interval=10, ping_timeout=10) as ws:
+            # ping_interval=30 / ping_timeout=30: relaxed to prevent 1011 Keepalive
+            # drop storms that trigger Cloudflare rate limits.
+            async with websockets.connect(
+                CLOB_WS_URL, ping_interval=30, ping_timeout=30
+            ) as ws:
                 await asyncio.sleep(0.5)  # let handshake stabilize
                 print(
                     f"{Fore.GREEN}[ORDERBOOK] WS connected."
@@ -273,23 +295,31 @@ async def _ws_worker() -> None:
                         f"{len(target_tokens)} token(s)."
                     )
 
+                # Mark the WebSocket as live — signals may now be generated.
+                _WS_CONNECTED = True
+                reconnect_delay = _BACKOFF_BASE  # reset backoff on successful connect
+
                 await asyncio.gather(
                     _ws_receive_loop(ws),
                     _maintenance_loop(ws),
                 )
 
         except websockets.exceptions.ConnectionClosed as exc:
+            _WS_CONNECTED = False
             print(
                 f"{Fore.YELLOW}[ORDERBOOK] WS closed: {exc} "
-                f"— reconnecting in {RECONNECT_DELAY_SECONDS}s..."
+                f"— reconnecting in {reconnect_delay}s..."
             )
         except Exception as exc:
+            _WS_CONNECTED = False
             print(
                 f"{Fore.RED}[ORDERBOOK] WS error: {exc} "
-                f"— reconnecting in {RECONNECT_DELAY_SECONDS}s..."
+                f"— reconnecting in {reconnect_delay}s..."
             )
 
-        await asyncio.sleep(RECONNECT_DELAY_SECONDS)
+        await asyncio.sleep(reconnect_delay)
+        # Exponential backoff — double delay up to the cap.
+        reconnect_delay = min(reconnect_delay * 2, _BACKOFF_MAX)
 
 
 async def run_orderbook_cache() -> None:
