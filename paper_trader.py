@@ -20,6 +20,7 @@ from config import Config
 from oracle import LATEST_PRICES
 from scanner import get_active_markets
 from signal_engine import SIGNAL_HISTORY
+import orderbook_cache as clob_cache
 
 GAMMA_API_URL = "https://gamma-api.polymarket.com/markets"
 RESOLUTION_CHECK_DELAY = 60  # seconds to wait before re-checking unresolved markets
@@ -197,6 +198,11 @@ def get_paper_state() -> dict:
     return PAPER_STATE
 
 
+def get_open_positions() -> dict:
+    """Return the open positions dict (condition_id -> position) for the hedge loop."""
+    return PAPER_STATE["open_positions"]
+
+
 def get_performance_summary() -> dict:
     """Return a concise performance snapshot."""
     total_trades = PAPER_STATE["total_trades"]
@@ -220,6 +226,79 @@ def get_performance_summary() -> dict:
         "total_lost_usd": PAPER_STATE["total_lost_usd"],
         "open_positions": len(PAPER_STATE["open_positions"]),
     }
+
+
+async def execute_hedge_dump(condition_id: str) -> None:
+    """Emergency liquidation: aggressively sell the entire position into the live book.
+
+    Phase 3 Escape Hatch — called by signal_engine when a baseline breach is detected.
+
+    Execution model:
+      1. Fetch the best available bid from the in-memory CLOB orderbook cache.
+      2. Mark exit price as best_bid (aggressive taker — selling INTO existing demand).
+      3. Calculate spread loss (entry_price - best_bid) and apply CLOB exit fee.
+      4. Close the position via _close_position() which handles all P&L accounting
+         and SQLite writes atomically.
+
+    Thread-safety: _close_position() is called synchronously on the event loop
+    thread (same thread as the asyncio loop) so no additional locking is needed
+    — identical to the existing settlement path.
+    """
+    position = PAPER_STATE["open_positions"].get(condition_id)
+    if position is None:
+        # Already closed by the monitor loop or a previous hedge call
+        return
+
+    sym = position.get("symbol", "?").upper()
+    side = position.get("side", "?")
+    token_id: str = position.get("token_id", "")
+    entry_price: float = position.get("entry_price", 0.0)
+    shares: float = position.get("shares", 0.0)
+
+    # ── Determine exit price: best bid from CLOB cache (aggressive taker sell) ───
+    exit_price: float = 0.0
+    if token_id:
+        book = clob_cache.get_orderbook(token_id)
+        if book:
+            bids = book.get("bids", {})
+            if bids:
+                # Best bid = highest available price buyers will pay
+                exit_price = max(float(p) for p in bids)
+
+    # Fallback: if orderbook is unavailable, use last known price minus spread
+    if exit_price == 0.0:
+        # Conservative estimate: ~1% spread degradation from entry price
+        exit_price = max(0.0, entry_price * 0.99)
+        print(
+            f"{Fore.YELLOW}[HEDGE] No live book for {sym} {side} — "
+            f"using fallback exit price: ${exit_price:.4f}"
+        )
+
+    # ── CLOB exit fee on the proceeds ───────────────────────────────────────────
+    clob_exit_fee: float = (exit_price * shares) * Config.CLOB_FEE_PCT
+    spread_loss: float = (entry_price - exit_price) * shares  # always >= 0 on dump
+    net_exit_cost: float = spread_loss + clob_exit_fee        # total friction of dump
+
+    print(
+        f"{Fore.RED}{Style.BRIGHT}"
+        f"[HEDGE] 🚨 EMERGENCY DUMP: {sym} {side}\n"
+        f"[HEDGE]   Entry price : ${entry_price:.4f}\n"
+        f"[HEDGE]   Best bid    : ${exit_price:.4f}  (aggressive taker fill)\n"
+        f"[HEDGE]   Spread loss : ${spread_loss:.4f}\n"
+        f"[HEDGE]   CLOB fee    : ${clob_exit_fee:.4f}\n"
+        f"[HEDGE]   Net exit cost: ${net_exit_cost:.4f}\n"
+        f"[HEDGE]   Shares       : {shares:.4f}\n"
+        f"[HEDGE]   Closing position in DB..."
+    )
+
+    # Delegate to the existing close path — handles all accounting + SQLite writes
+    _close_position(condition_id, exit_price, "hedge_dump")
+
+    print(
+        f"{Fore.GREEN}[HEDGE] ✅ Position {condition_id[:8]}... closed via hedge dump. "
+        f"Capital preserved: ${PAPER_STATE['capital']:.2f}"
+    )
+
 
 
 # ---------------------------------------------------------------------------

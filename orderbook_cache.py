@@ -1,12 +1,21 @@
 # orderbook_cache.py
-"""Polymarket CLOB in-memory order book cache via WebSocket + REST snapshot."""
+"""Polymarket CLOB in-memory order book cache via WebSocket + REST snapshot.
+
+Network resilience layer:
+  • WS 1001 "Going Away" interceptor with exponential backoff (1→2→4→8→60s cap).
+  • Active keep-alive heartbeat: ping sent every 15s; pong timeout triggers recycle.
+  • Forced cache invalidation on any disconnect — prevents signal_engine from
+    reading stale/"ghost" data while reconnecting.
+"""
 
 import asyncio
 import json
+import time
 from collections import defaultdict
 
 import aiohttp
 import websockets
+import websockets.exceptions
 from colorama import Fore, Style, init
 
 from config import Config
@@ -16,11 +25,21 @@ init(autoreset=True)
 
 CLOB_REST_URL = Config.POLYMARKET_HOST
 CLOB_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-RECONNECT_DELAY_SECONDS = 3
 SNAPSHOT_TIMEOUT_SECONDS = 10
 
+# ---------------------------------------------------------------------------
+# Keep-alive / backoff constants
+# ---------------------------------------------------------------------------
+HEARTBEAT_INTERVAL_SECONDS: int = 15       # ping cadence
+HEARTBEAT_PONG_TIMEOUT_SECONDS: int = 10   # max wait for pong before recycle
+BACKOFF_BASE_SECONDS: float = 1.0          # first retry delay
+BACKOFF_MAX_SECONDS: float = 60.0          # ceiling for exponential backoff
+
+# ---------------------------------------------------------------------------
 # In-memory order book cache:
-#   _ORDERBOOKS[token_id] = {"bids": {price_str: size}, "asks": {price_str: size}, "timestamp": float}
+#   _ORDERBOOKS[token_id] = {"bids": {price_str: size}, "asks": {price_str: size},
+#                             "timestamp": float, "ready": bool}
+# ---------------------------------------------------------------------------
 _ORDERBOOKS: dict[str, dict] = defaultdict(lambda: {
     "bids": {},
     "asks": {},
@@ -193,7 +212,35 @@ async def _seed_snapshots(token_ids: set[str]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# WebSocket worker
+# Cache invalidation hook  (Feature #3)
+# ---------------------------------------------------------------------------
+
+def _invalidate_cache() -> None:
+    """Purge all cached order book data on disconnect.
+
+    Sets every entry's bids/asks to empty dicts and marks ready=False so that
+    get_orderbook() and validate_liquidity() return None/False immediately.
+    Upstream components (signal_engine) are therefore hard-blocked from reading
+    stale or ghost data during any reconnection window.
+
+    This mutates the existing dict objects in-place rather than replacing
+    _ORDERBOOKS itself, so there is no risk of a reference becoming orphaned.
+    """
+    count = len(_ORDERBOOKS)
+    for entry in _ORDERBOOKS.values():
+        entry["bids"] = {}
+        entry["asks"] = {}
+        entry["ready"] = False
+        entry["timestamp"] = 0.0
+    if count:
+        print(
+            f"{Fore.YELLOW}[ORDERBOOK] 🧹 Cache INVALIDATED — {count} token(s) "
+            f"zeroed out. Signal engine blocked until reconnect + re-snapshot."
+        )
+
+
+# ---------------------------------------------------------------------------
+# WebSocket workers
 # ---------------------------------------------------------------------------
 
 async def _maintenance_loop(ws) -> None:
@@ -255,35 +302,74 @@ async def _ws_receive_loop(ws) -> None:
             )
 
 
+async def _heartbeat_loop(ws) -> None:
+    """Active keep-alive: send a WebSocket ping every 15 seconds.  (Feature #2)
+
+    Waits for the corresponding pong within HEARTBEAT_PONG_TIMEOUT_SECONDS.
+    If the exchange does not acknowledge within that window, raises an
+    asyncio.TimeoutError so that the outer gather() tears down all tasks and
+    triggers the reconnection cycle.
+    """
+    while True:
+        await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+        try:
+            latency = await asyncio.wait_for(
+                ws.ping(),
+                timeout=HEARTBEAT_PONG_TIMEOUT_SECONDS,
+            )
+            # ws.ping() returns a coroutine/future that resolves to round-trip time
+            # in seconds (float) once the pong is received.
+            print(
+                f"{Fore.CYAN}[ORDERBOOK] 💓 Heartbeat OK — "
+                f"pong received (rtt≈{latency * 1000:.1f} ms)"
+            )
+        except asyncio.TimeoutError:
+            print(
+                f"{Fore.RED}[ORDERBOOK] 💔 Heartbeat TIMEOUT — "
+                f"no pong within {HEARTBEAT_PONG_TIMEOUT_SECONDS}s. "
+                f"Recycling connection..."
+            )
+            # Close the WebSocket to force a reconnect in the outer loop.
+            await ws.close()
+            raise  # propagate so gather() terminates all sibling tasks
+
+
 async def _ws_worker() -> None:
-    """Persistent WebSocket connection with auto-reconnect and dynamic subscriptions."""
+    """Persistent WebSocket connection with auto-reconnect, heartbeat and dynamic subs.
+
+    Reconnection schedule (exponential backoff, Feature #1):
+        attempt 1 → 1s wait
+        attempt 2 → 2s
+        attempt 3 → 4s
+        attempt 4 → 8s
+        attempt 5+ → 60s (cap)
+    """
     global _SUBSCRIBED_TOKENS, _WS_CONNECTED
 
-    # Exponential backoff: 3s → 6s → 12s (capped at 12s)
-    _BACKOFF_BASE = 3
-    _BACKOFF_MAX = 12
-    reconnect_delay = _BACKOFF_BASE
+    reconnect_delay: float = BACKOFF_BASE_SECONDS
 
     while True:
         # Determine target token IDs from current active markets
         target_tokens = _token_ids_from_markets()
         if target_tokens:
-            # Seed snapshots before connecting
+            # Seed snapshots before connecting so the cache is ready immediately
+            # after handshake, not after the first delta burst.
             await _seed_snapshots(target_tokens)
 
         try:
             print(
-                f"{Fore.GREEN}[ORDERBOOK] Connecting to Polymarket CLOB WS..."
+                f"{Fore.GREEN}[ORDERBOOK] Connecting to Polymarket CLOB WS "
+                f"(next backoff if fail: {reconnect_delay:.0f}s)..."
             )
-            # ping_interval=30 / ping_timeout=30: relaxed to prevent 1011 Keepalive
-            # drop storms that trigger Cloudflare rate limits.
+            # Disable the built-in ping_interval so our explicit heartbeat loop
+            # is the sole keep-alive mechanism — prevents double-ping conflicts.
             async with websockets.connect(
-                CLOB_WS_URL, ping_interval=30, ping_timeout=30
+                CLOB_WS_URL,
+                ping_interval=None,   # heartbeat managed by _heartbeat_loop
+                ping_timeout=None,
             ) as ws:
                 await asyncio.sleep(0.5)  # let handshake stabilize
-                print(
-                    f"{Fore.GREEN}[ORDERBOOK] WS connected."
-                )
+                print(f"{Fore.GREEN}[ORDERBOOK] ✅ WS connected.")
 
                 # Subscribe to all token IDs
                 if target_tokens:
@@ -297,29 +383,73 @@ async def _ws_worker() -> None:
 
                 # Mark the WebSocket as live — signals may now be generated.
                 _WS_CONNECTED = True
-                reconnect_delay = _BACKOFF_BASE  # reset backoff on successful connect
+                reconnect_delay = BACKOFF_BASE_SECONDS  # reset backoff on success
 
+                # Run all three concurrent tasks under this connection.
+                # Any one raising cancels the rest → falls through to reconnect.
                 await asyncio.gather(
                     _ws_receive_loop(ws),
                     _maintenance_loop(ws),
+                    _heartbeat_loop(ws),
                 )
 
-        except websockets.exceptions.ConnectionClosed as exc:
+        # ── Feature #1: WS 1001 "Going Away" interceptor ────────────────────
+        except websockets.exceptions.ConnectionClosedOK as exc:
             _WS_CONNECTED = False
-            print(
-                f"{Fore.YELLOW}[ORDERBOOK] WS closed: {exc} "
-                f"— reconnecting in {reconnect_delay}s..."
-            )
-        except Exception as exc:
+            _invalidate_cache()  # Feature #3: hard-purge stale data immediately
+            if exc.rcvd is not None and exc.rcvd.code == 1001:
+                print(
+                    f"{Fore.YELLOW}[ORDERBOOK] ⚡ WS 1001 'Going Away' — "
+                    f"server evicted this connection (Cloudflare/load-balancer recycle). "
+                    f"Reconnecting in {reconnect_delay:.0f}s with exponential backoff..."
+                )
+            else:
+                print(
+                    f"{Fore.YELLOW}[ORDERBOOK] WS closed cleanly (code="
+                    f"{exc.rcvd.code if exc.rcvd else '?'}) — "
+                    f"reconnecting in {reconnect_delay:.0f}s..."
+                )
+
+        except websockets.exceptions.ConnectionClosedError as exc:
             _WS_CONNECTED = False
+            _invalidate_cache()  # Feature #3
             print(
-                f"{Fore.RED}[ORDERBOOK] WS error: {exc} "
-                f"— reconnecting in {reconnect_delay}s..."
+                f"{Fore.RED}[ORDERBOOK] WS closed with error: {exc} "
+                f"— reconnecting in {reconnect_delay:.0f}s..."
             )
 
+        except websockets.exceptions.ConnectionClosed as exc:
+            # Catch-all for any other ConnectionClosed subclass
+            _WS_CONNECTED = False
+            _invalidate_cache()  # Feature #3
+            print(
+                f"{Fore.YELLOW}[ORDERBOOK] WS connection closed: {exc} "
+                f"— reconnecting in {reconnect_delay:.0f}s..."
+            )
+
+        except asyncio.TimeoutError:
+            # Raised by _heartbeat_loop when pong is not received in time
+            _WS_CONNECTED = False
+            _invalidate_cache()  # Feature #3
+            print(
+                f"{Fore.RED}[ORDERBOOK] Heartbeat pong timeout — "
+                f"recycling connection in {reconnect_delay:.0f}s..."
+            )
+
+        except Exception as exc:
+            _WS_CONNECTED = False
+            _invalidate_cache()  # Feature #3
+            print(
+                f"{Fore.RED}[ORDERBOOK] WS unexpected error: {exc} "
+                f"— reconnecting in {reconnect_delay:.0f}s..."
+            )
+
+        # ── Exponential backoff: 1 → 2 → 4 → 8 → 60s (cap) ─────────────────
+        print(
+            f"{Fore.YELLOW}[ORDERBOOK] ⏳ Waiting {reconnect_delay:.0f}s before reconnect..."
+        )
         await asyncio.sleep(reconnect_delay)
-        # Exponential backoff — double delay up to the cap.
-        reconnect_delay = min(reconnect_delay * 2, _BACKOFF_MAX)
+        reconnect_delay = min(reconnect_delay * 2, BACKOFF_MAX_SECONDS)
 
 
 async def run_orderbook_cache() -> None:

@@ -6,6 +6,13 @@ When oracle is clearly above/below PTB, the correct-side token is still cheap.
 We enter before the market catches up.
 
 PTB = LATEST_PRICES[oracle_key]["open_price"]  (Chainlink price at period start)
+
+Phase 3 — Mid-Epoch Active Hedging:
+  For every open position, the evaluation loop checks whether the Binance spot
+  oracle has crossed the epoch open_price in the wrong direction ("baseline breach").
+  If it has, and the contract is still within HEDGE_WINDOW_SECONDS of expiry, the
+  escape hatch fires: execute_hedge_dump() is called on the active trader instance
+  to aggressively liquidate the position before expiration locks in a 100% loss.
 """
 
 import asyncio
@@ -27,7 +34,28 @@ EVAL_INTERVAL_SECONDS = 1
 SIGNALED_MARKETS_CLEAR_INTERVAL = 900   # clear every 15 minutes (one market period)
 DIAGNOSTIC_INTERVAL_SECONDS = 10        # print full market status every 10s
 
+# ---------------------------------------------------------------------------
+# Phase 3: Mid-Epoch Active Hedging constants
+# ---------------------------------------------------------------------------
+# Window (seconds) before contract expiry inside which the escape hatch can fire.
+# Mirrors Config.MAX_EXECUTION_TIME_SECONDS — positions entered in this window
+# need an exit path if the oracle reversal invalidates the original edge.
+HEDGE_WINDOW_SECONDS: int = 90
+
+# Tracks condition_ids already hedged this epoch so we never double-dump.
+_HEDGED_POSITIONS: set[str] = set()
+
+# Injected at startup by main.py via register_hedge_callback().
+# Signature: async def hedge_fn(condition_id: str) -> None
+_hedge_callback: "callable | None" = None
+
+# Injected at startup by main.py via register_positions_callback().
+# Signature: def positions_fn() -> dict[str, dict]
+_get_open_positions_fn: "callable | None" = None
+
+# ---------------------------------------------------------------------------
 # Set of condition_ids already signaled this hour
+# ---------------------------------------------------------------------------
 SIGNALED_MARKETS: set[str] = set()
 
 # Ordered signal history — capped at 100
@@ -57,6 +85,35 @@ def get_signal_stats() -> dict:
         "signals_today": _signals_today,
         "last_signal_time": _last_signal_time,
     }
+
+
+def register_hedge_callback(fn: "callable") -> None:
+    """Register the active trader's hedge-dump coroutine with the signal engine.
+
+    Called once at startup (main.py) after both the signal engine and the active
+    trader module are imported.  This avoids circular imports — the signal engine
+    never imports paper_trader or live_trader directly.
+
+    ``fn`` must be an async callable with signature:
+        async def fn(condition_id: str) -> None
+    """
+    global _hedge_callback
+    _hedge_callback = fn
+    print(f"{Fore.CYAN}[SIGNAL] Hedge callback registered: {getattr(fn, '__qualname__', repr(fn))}")
+
+
+def register_positions_callback(fn: "callable") -> None:
+    """Register a synchronous getter that returns the trader's open positions dict.
+
+    Called once at startup (main.py).  Used by the escape-hatch loop to read the
+    active positions from whichever trader (paper or live) is running.
+
+    ``fn`` must be a synchronous callable with signature:
+        def fn() -> dict[str, dict]   # condition_id -> position dict
+    """
+    global _get_open_positions_fn
+    _get_open_positions_fn = fn
+    print(f"{Fore.CYAN}[SIGNAL] Positions callback registered: {getattr(fn, '__qualname__', repr(fn))}")
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +361,95 @@ def _print_diagnostics(markets: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Phase 3: Escape Hatch — hedge trigger evaluation
+# ---------------------------------------------------------------------------
+
+async def _check_hedge_triggers(open_positions: dict) -> None:
+    """Scan all open positions for a baseline breach and fire the escape hatch.
+
+    A "baseline breach" means the Binance spot oracle has crossed the epoch
+    open_price in the direction that invalidates the original trade thesis:
+      • UP position  → current spot < open_price  (market is now going DOWN)
+      • DOWN position → current spot > open_price  (market is now going UP)
+
+    The check is only active while the position is still within HEDGE_WINDOW_SECONDS
+    of its entry window (time_remaining was recorded at open).  Expired contracts
+    should already be settling via the monitor loop — we don't touch those.
+
+    This function never raises; all errors are caught and logged.
+    """
+    global _HEDGED_POSITIONS
+
+    if _hedge_callback is None:
+        return  # no trader registered yet — skip silently
+
+    if not open_positions:
+        return
+
+    now = time.time()
+    triggers: list[str] = []
+
+    for condition_id, position in open_positions.items():
+        # Skip already-hedged positions (idempotency guard)
+        if condition_id in _HEDGED_POSITIONS:
+            continue
+
+        symbol: str = position.get("symbol", "")
+        side: str = position.get("side", "")
+        ptb: float = position.get("price_to_beat", 0.0)   # epoch open_price
+        entry_time: float = position.get("entry_time", 0.0)
+
+        if not symbol or not side or ptb == 0.0:
+            continue
+
+        # Only act while position is within the hedge window
+        elapsed = now - entry_time
+        if elapsed > HEDGE_WINDOW_SECONDS:
+            continue
+
+        # Pull live Binance spot price from oracle in-process RAM dict
+        oracle_key = f"{symbol.lower()}/usd"
+        oracle_entry = LATEST_PRICES.get(oracle_key, {})
+        spot: float = oracle_entry.get("price", 0.0)
+
+        if spot == 0.0:
+            continue  # oracle not ready — don't act on missing data
+
+        # ── Baseline breach detection ────────────────────────────────────────
+        breach = False
+        if side == "UP" and spot < ptb:
+            breach = True
+        elif side == "DOWN" and spot > ptb:
+            breach = True
+        # ─────────────────────────────────────────────────────────────────────
+
+        if breach:
+            print(
+                f"\n{Fore.RED}{Style.BRIGHT}"
+                f"[HEDGE] 🚨 ESCAPE HATCH TRIGGERED for {symbol.upper()}!\n"
+                f"[HEDGE]    Position side  : {side}\n"
+                f"[HEDGE]    Epoch PTB      : ${ptb:,.4f}\n"
+                f"[HEDGE]    Current spot   : ${spot:,.4f}  ← crossed baseline\n"
+                f"[HEDGE]    Elapsed        : {elapsed:.1f}s into position\n"
+                f"[HEDGE]    Liquidating position to preserve capital..."
+            )
+            triggers.append(condition_id)
+
+    # Execute hedges outside the iteration loop to avoid mutating the dict
+    for condition_id in triggers:
+        _HEDGED_POSITIONS.add(condition_id)   # mark BEFORE async call → idempotent
+        try:
+            await _hedge_callback(condition_id)
+        except Exception as exc:
+            print(
+                f"{Fore.RED}[HEDGE] ⚠️  execute_hedge_dump raised an error for "
+                f"{condition_id[:8]}...: {exc}"
+            )
+            # Don't remove from _HEDGED_POSITIONS — we already tried once.
+            # The position monitor loop will clean it up on expiry.
+
+
+# ---------------------------------------------------------------------------
 # Evaluation loop
 # ---------------------------------------------------------------------------
 
@@ -336,10 +482,14 @@ async def _evaluate_once(markets: dict) -> int:
 
 
 async def run_signal_engine() -> None:
-    """Evaluate all active markets every second. Public coroutine for main.py."""
+    """Evaluate all active markets and open-position hedge triggers every second."""
     global _last_diag_ts
 
-    print(f"{Fore.WHITE}[SIGNAL] Signal engine started (eval every {EVAL_INTERVAL_SECONDS}s, diag every {DIAGNOSTIC_INTERVAL_SECONDS}s).")
+    print(
+        f"{Fore.WHITE}[SIGNAL] Signal engine started "
+        f"(eval every {EVAL_INTERVAL_SECONDS}s, diag every {DIAGNOSTIC_INTERVAL_SECONDS}s, "
+        f"hedge window={HEDGE_WINDOW_SECONDS}s)."
+    )
 
     while True:
         try:
@@ -364,6 +514,19 @@ async def run_signal_engine() -> None:
             if time.time() - _last_diag_ts >= DIAGNOSTIC_INTERVAL_SECONDS:
                 _print_diagnostics(markets)
                 _last_diag_ts = time.time()
+
+            # ── Phase 3: Escape Hatch ─────────────────────────────────────────
+            # Pull live open positions from the active trader and check each one
+            # for a baseline breach.  _get_open_positions_fn is injected by main.py
+            # via register_hedge_callback() — we piggy-back the same registry.
+            if _hedge_callback is not None and _get_open_positions_fn is not None:
+                try:
+                    open_positions: dict = _get_open_positions_fn()
+                    if open_positions:
+                        await _check_hedge_triggers(open_positions)
+                except Exception as exc:
+                    print(f"{Fore.RED}[SIGNAL] Hedge check error: {exc}")
+            # ─────────────────────────────────────────────────────────────────
 
             generated = await _evaluate_once(markets)
 

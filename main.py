@@ -12,7 +12,12 @@ from config import Config
 from orderbook_cache import run_orderbook_cache
 from oracle import run_oracle
 from scanner import get_market_count, run_scanner
-from signal_engine import get_signal_stats, run_signal_engine
+from signal_engine import (
+    get_signal_stats,
+    run_signal_engine,
+    register_hedge_callback,
+    register_positions_callback,
+)
 
 init(autoreset=True)
 
@@ -32,10 +37,20 @@ STATS_INTERVAL_SECONDS = 60
 # ---------------------------------------------------------------------------
 
 if Config.PAPER_TRADING:
-    from paper_trader import get_performance_summary, run_paper_trader as _run_trader
+    from paper_trader import (
+        get_performance_summary,
+        run_paper_trader as _run_trader,
+        execute_hedge_dump as _trader_hedge_dump,
+        get_open_positions as _trader_get_positions,
+    )
     _TRADER_NAME = "paper_trader"
 else:
-    from live_trader import get_performance_summary, run_live_trader as _run_trader  # type: ignore[no-redef]
+    from live_trader import (  # type: ignore[no-redef]
+        get_performance_summary,
+        run_live_trader as _run_trader,
+        execute_hedge_dump as _trader_hedge_dump,
+        get_open_positions as _trader_get_positions,
+    )
     _TRADER_NAME = "live_trader"
 
 # Maps a task name to its coroutine factory for the Execution Engine group
@@ -45,6 +60,13 @@ _TASK_FACTORIES: dict[str, callable] = {
     "signal_engine": run_signal_engine,
     _TRADER_NAME: _run_trader,
 }
+
+# Register the escape-hatch callbacks with the signal engine.
+# Done here (post-import) to avoid circular imports between signal_engine
+# and the trader modules.  Both callbacks are injected once at process start.
+register_hedge_callback(_trader_hedge_dump)
+register_positions_callback(_trader_get_positions)
+
 
 
 # ---------------------------------------------------------------------------

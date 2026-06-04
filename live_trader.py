@@ -14,10 +14,11 @@ from colorama import Fore, Style, init
 from eth_account import Account
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
-from py_clob_client.constants import BUY
+from py_clob_client.constants import BUY, SELL
 
 from config import Config
 from signal_engine import SIGNAL_HISTORY
+import orderbook_cache as clob_cache
 # SQLite persistence — re-uses paper_trader's DB layer (separate logical namespace)
 from paper_trader import (
     _save_position as _db_save_position,
@@ -152,6 +153,11 @@ def _live_load_state() -> None:
 
 def get_live_state() -> dict:
     return LIVE_STATE
+
+
+def get_open_positions() -> dict:
+    """Return the open positions dict (condition_id -> position) for the hedge loop."""
+    return LIVE_STATE["open_positions"]
 
 
 def get_performance_summary() -> dict:
@@ -367,6 +373,119 @@ async def _open_live_position(signal: dict) -> None:
         f"shares={shares:.4f}  entry={entry_price:.4f}  cost=${cost:.2f}  "
         f"clob_fee=${clob_entry_fee:.4f}  "
         f"avail=${LIVE_STATE['available_capital']:.2f}"
+    )
+
+
+async def execute_hedge_dump(condition_id: str) -> None:
+    """Emergency liquidation: aggressively sell the entire live position into the orderbook.
+
+    Phase 3 Escape Hatch — called by signal_engine when a baseline breach is detected.
+
+    Execution model:
+      1. Fetch the best available bid from the in-memory CLOB orderbook cache.
+      2. Construct a GTC sell limit order at best_bid (aggressive taker price).
+      3. Sign and broadcast the order via py-clob-client with a 10-second timeout.
+      4. Call _record_settlement() with exact fee accounting regardless of broadcast
+         status (conservatively marks as closed to prevent double-dump).
+
+    Security: all exception messages suppressed (may embed signing key material).
+    """
+    position = LIVE_STATE["open_positions"].get(condition_id)
+    if position is None:
+        return  # Already closed or hedged
+
+    sym = position.get("symbol", "?").upper()
+    side = position.get("side", "?")
+    token_id: str = position.get("token_id", "")
+    entry_price: float = position.get("entry_price", 0.0)
+    shares: float = position.get("shares", 0.0)
+
+    if shares <= 0 or not token_id:
+        print(f"{Fore.RED}[HEDGE] [LIVE] Invalid position state for {condition_id[:8]}... — skipping.")
+        return
+
+    # ── Determine exit price: best bid from CLOB cache (aggressive taker sell) ───
+    exit_price: float = 0.0
+    book = clob_cache.get_orderbook(token_id)
+    if book:
+        bids = book.get("bids", {})
+        if bids:
+            exit_price = max(float(p) for p in bids)
+
+    if exit_price == 0.0:
+        exit_price = max(0.0, entry_price * 0.99)
+        print(
+            f"{Fore.YELLOW}[HEDGE] [LIVE] No live book for {sym} {side} — "
+            f"using conservative fallback exit: ${exit_price:.4f}"
+        )
+
+    # ── Fee math ─────────────────────────────────────────────────────────────────
+    clob_exit_fee: float = (exit_price * shares) * Config.CLOB_FEE_PCT
+    spread_loss: float = (entry_price - exit_price) * shares
+    net_exit_cost: float = spread_loss + clob_exit_fee
+
+    print(
+        f"{Fore.RED}{Style.BRIGHT}"
+        f"[HEDGE] 🚨 LIVE EMERGENCY DUMP: {sym} {side}\n"
+        f"[HEDGE]   Entry price  : ${entry_price:.4f}\n"
+        f"[HEDGE]   Best bid     : ${exit_price:.4f}  (aggressive taker fill)\n"
+        f"[HEDGE]   Spread loss  : ${spread_loss:.4f}\n"
+        f"[HEDGE]   CLOB fee     : ${clob_exit_fee:.4f}\n"
+        f"[HEDGE]   Net exit cost: ${net_exit_cost:.4f}\n"
+        f"[HEDGE]   Shares       : {shares:.4f}\n"
+        f"[HEDGE]   Broadcasting SELL order to Polymarket CLOB..."
+    )
+
+    # ── Broadcast sell order ──────────────────────────────────────────────────────
+    order_placed = False
+    try:
+        sell_args = OrderArgs(
+            token_id=token_id,
+            price=round(exit_price, 4),
+            size=round(shares, 4),
+            side=SELL,
+        )
+        client = _get_client()
+        signed_sell = await asyncio.to_thread(client.create_order, sell_args)
+        resp = await asyncio.wait_for(
+            asyncio.to_thread(client.post_order, signed_sell, OrderType.GTC),
+            timeout=10.0,
+        )
+        if isinstance(resp, dict) and resp.get("success", False):
+            order_id = resp.get("orderID", resp.get("order_id", "N/A"))
+            print(
+                f"{Fore.GREEN}[HEDGE] [LIVE] ✅ Sell order accepted — "
+                f"orderID={order_id}  price={exit_price:.4f}  shares={shares:.4f}"
+            )
+            order_placed = True
+        else:
+            error_msg = resp.get("errorMsg", "unknown") if isinstance(resp, dict) else "?"
+            print(
+                f"{Fore.RED}[HEDGE] [LIVE] Sell order REJECTED by CLOB: {error_msg} — "
+                f"recording as closed conservatively to prevent double-dump."
+            )
+    except asyncio.TimeoutError:
+        print(
+            f"{Fore.RED}[HEDGE] [LIVE] SELL BROADCAST TIMEOUT — "
+            f"state unknown. Marking closed conservatively. "
+            f"Verify on Polymarket dashboard immediately."
+        )
+    except Exception:
+        # Suppress details — py-clob-client errors may embed private key material
+        print(
+            f"{Fore.RED}[HEDGE] [LIVE] Sell order error (details suppressed). "
+            f"Marking position closed conservatively."
+        )
+
+    # ── Record settlement regardless of broadcast status ─────────────────────────
+    # Conservative close: if order status is unknown, use exit_price to avoid
+    # a double-sell if the order DID fill.  SQLite write happens here.
+    _record_settlement(condition_id, exit_price, "hedge_dump")
+
+    result_tag = "order confirmed" if order_placed else "conservative close"
+    print(
+        f"{Fore.GREEN}[HEDGE] [LIVE] ✅ Position {condition_id[:8]}... hedged ({result_tag}). "
+        f"Capital: ${LIVE_STATE['capital']:.2f}"
     )
 
 
