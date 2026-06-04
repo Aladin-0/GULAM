@@ -45,20 +45,31 @@ init(autoreset=True)
 def _build_clob_client() -> ClobClient:
     """Instantiate and return a V2-authenticated ClobClient.
 
-    signature_type=POLY_PROXY (1): the EOA signs orders on behalf of the
-    Polymarket deposit/proxy wallet (funder). The funder address is read from
-    POLYMARKET_PROXY_WALLET in .env (populated by running find_proxy.py).
-    If not set, falls back to EOA — but orders will likely be rejected.
+    Reads two .env keys:
+      POLYMARKET_SIG_TYPE     — 1=POLY_PROXY, 3=POLY_1271 (default: 3)
+      POLYMARKET_PROXY_WALLET — deposit/proxy wallet address (funder)
+
+    For Polymarket V2:
+      - Funds deposited via website live in a deposit wallet smart contract.
+      - signature_type=3 (POLY_1271): EOA signs; deposit contract verifies via
+        EIP-1271 isValidSignature(). Required when maker = deposit wallet.
+      - signature_type=1 (POLY_PROXY): for old V1-style proxy wallets.
     """
     import os as _os
     proxy_wallet: str = _os.getenv("POLYMARKET_PROXY_WALLET", "").strip()
+    sig_type: int = int(_os.getenv("POLYMARKET_SIG_TYPE", "3"))
+
+    sig_name = {1: "POLY_PROXY", 3: "POLY_1271"}.get(sig_type, str(sig_type))
+    print(f"{Fore.CYAN}[LIVE] Signature type : {sig_type} ({sig_name})")
+
     if proxy_wallet:
-        print(f"{Fore.CYAN}[LIVE] Proxy wallet (funder): {proxy_wallet}")
+        print(f"{Fore.CYAN}[LIVE] Deposit wallet : {proxy_wallet}")
     else:
         print(
-            f"{Fore.YELLOW}[LIVE] ⚠️  POLYMARKET_PROXY_WALLET not set in .env. "
-            f"Run find_proxy.py to discover it. Falling back to EOA address — "
-            f"orders may be rejected."
+            f"{Fore.YELLOW}[LIVE] ⚠️  POLYMARKET_PROXY_WALLET not set in .env.\n"
+            f"         Open polygonscan.com/address/<your-EOA> in browser,\n"
+            f"         find the deposit wallet contract, paste it in .env,\n"
+            f"         then restart the bot."
         )
 
     creds = ApiCreds(
@@ -71,8 +82,8 @@ def _build_clob_client() -> ClobClient:
         chain_id=Config.CHAIN_ID,
         key=Config.PRIVATE_KEY,
         creds=creds,
-        signature_type=1,                              # POLY_PROXY
-        funder=proxy_wallet if proxy_wallet else None, # deposit wallet address
+        signature_type=sig_type,
+        funder=proxy_wallet if proxy_wallet else None,
     )
     return client
 
