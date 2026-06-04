@@ -1,7 +1,7 @@
 # live_trader.py
 """Live execution layer — routes signals to the Polymarket CLOB on Polygon Mainnet.
 
-Only active when PAPER_TRADING=False. Uses py-clob-client to construct,
+Only active when PAPER_TRADING=False. Uses py-clob-client-v2 to construct,
 sign (ECDSA via private key), and broadcast real limit orders.
 """
 
@@ -12,11 +12,15 @@ from datetime import date
 import aiohttp
 from colorama import Fore, Style, init
 from eth_account import Account
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
-# py_clob_client expects plain strings for order side — not module-level constants
-BUY = "BUY"
-SELL = "SELL"
+# V2 SDK — replaces archived py-clob-client
+from py_clob_client_v2 import (
+    ClobClient,
+    ApiCreds,
+    OrderArgs,
+    OrderType,
+    PartialCreateOrderOptions,
+    Side,
+)
 
 from config import Config
 from signal_engine import SIGNAL_HISTORY
@@ -39,21 +43,18 @@ init(autoreset=True)
 # ---------------------------------------------------------------------------
 
 def _build_clob_client() -> ClobClient:
-    """Instantiate and return an authenticated ClobClient."""
+    """Instantiate and return a V2-authenticated ClobClient."""
     creds = ApiCreds(
         api_key=Config.POLYMARKET_API_KEY,
         api_secret=Config.POLYMARKET_API_SECRET,
         api_passphrase=Config.POLYMARKET_API_PASSPHRASE,
     )
-    # Derive wallet address from private key — never trust a hardcoded string
-    derived_address: str = Account.from_key(Config.PRIVATE_KEY).address
+    # V2: no signature_type or funder required for EOA wallets
     client = ClobClient(
         host=Config.POLYMARKET_HOST,
         chain_id=Config.CHAIN_ID,
         key=Config.PRIVATE_KEY,
         creds=creds,
-        signature_type=0,       # EOA (Externally Owned Account) signing
-        funder=derived_address,
     )
     return client
 
@@ -244,18 +245,20 @@ async def _place_order(signal: dict, size_usd: float) -> dict | None:
         token_id=token_id,
         price=entry_price,
         size=shares,
-        side=BUY,
+        side=Side.BUY,
     )
 
     try:
         client = _get_client()
 
-        # Sign the order — pure CPU, no network
-        signed_order = await asyncio.to_thread(client.create_order, order_args)
-
-        # Broadcast with a hard 10-second timeout
+        # V2: single call signs + broadcasts; 10-second timeout
         resp = await asyncio.wait_for(
-            asyncio.to_thread(client.post_order, signed_order, OrderType.GTC),
+            asyncio.to_thread(
+                client.create_and_post_order,
+                order_args,
+                PartialCreateOrderOptions(tick_size="0.01"),
+                OrderType.GTC,
+            ),
             timeout=10.0,
         )
 
@@ -445,12 +448,17 @@ async def execute_hedge_dump(condition_id: str) -> None:
             token_id=token_id,
             price=round(exit_price, 4),
             size=round(shares, 4),
-            side=SELL,
+            side=Side.SELL,
         )
         client = _get_client()
-        signed_sell = await asyncio.to_thread(client.create_order, sell_args)
+        # V2: single call signs + broadcasts
         resp = await asyncio.wait_for(
-            asyncio.to_thread(client.post_order, signed_sell, OrderType.GTC),
+            asyncio.to_thread(
+                client.create_and_post_order,
+                sell_args,
+                PartialCreateOrderOptions(tick_size="0.01"),
+                OrderType.GTC,
+            ),
             timeout=10.0,
         )
         if isinstance(resp, dict) and resp.get("success", False):
@@ -472,10 +480,9 @@ async def execute_hedge_dump(condition_id: str) -> None:
             f"state unknown. Marking closed conservatively. "
             f"Verify on Polymarket dashboard immediately."
         )
-    except Exception:
-        # Suppress details — py-clob-client errors may embed private key material
+    except Exception as exc:  # pylint: disable=broad-except
         print(
-            f"{Fore.RED}[HEDGE] [LIVE] Sell order error (details suppressed). "
+            f"{Fore.RED}[HEDGE] [LIVE] Sell order failed: {type(exc).__name__}: {exc}. "
             f"Marking position closed conservatively."
         )
 
