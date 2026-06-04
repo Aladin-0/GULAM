@@ -32,7 +32,18 @@ PRIVATE_KEY = os.getenv("PRIVATE_KEY", "").strip()
 if not PRIVATE_KEY:
     sys.exit("ERROR: PRIVATE_KEY not found in .env")
 
-POLYGON_RPC = "https://polygon-rpc.com"
+# Try multiple RPCs — first one to connect wins
+POLYGON_RPCS = [
+    os.getenv("POLYGON_RPC_URL", ""),               # override via .env
+    "https://polygon-bor-rpc.publicnode.com",
+    "https://polygon.drpc.org",
+    "https://rpc.ankr.com/polygon",
+    "https://polygon.llamarpc.com",
+    "https://polygon-mainnet.public.blastapi.io",
+    "https://endpoints.omniatech.io/v1/matic/mainnet/public",
+    "https://polygon-rpc.com",
+    "https://1rpc.io/matic",
+]
 
 # Polygon contract addresses
 USDC_E_ADDRESS   = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
@@ -63,12 +74,37 @@ ONRAMP_ABI = [
 ]
 
 # --------------------------------------------------------------------------
-# Connect
+# Connect — try each RPC until one works
 # --------------------------------------------------------------------------
-print(f"\nConnecting to Polygon RPC...")
-w3 = Web3(Web3.HTTPProvider(POLYGON_RPC))
-if not w3.is_connected():
-    sys.exit("ERROR: Cannot connect to Polygon RPC. Check your internet connection.")
+print(f"\nConnecting to Polygon...")
+w3 = None
+for rpc_url in POLYGON_RPCS:
+    if not rpc_url:
+        continue
+    try:
+        _w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 10}))
+        if _w3.is_connected():
+            block = _w3.eth.block_number
+            print(f"  ✓ {rpc_url}  (block {block})")
+            w3 = _w3
+            break
+        else:
+            print(f"  ✗ {rpc_url}")
+    except Exception as e:
+        print(f"  ✗ {rpc_url} — {str(e)[:70]}")
+
+if w3 is None:
+    print("""
+ERROR: All Polygon RPCs failed. Your server may be restricting outbound connections.
+
+Fix: Add a private RPC key to .env:
+  Get a free key at https://alchemy.com → Create App → Polygon Mainnet
+  Then add to .env:
+    POLYGON_RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/YOUR_KEY
+
+Then re-run: python3 convert_to_pusd.py
+""")
+    sys.exit(1)
 
 acct = Account.from_key(PRIVATE_KEY)
 wallet = acct.address
