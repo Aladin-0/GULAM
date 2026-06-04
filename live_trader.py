@@ -43,18 +43,23 @@ init(autoreset=True)
 # ---------------------------------------------------------------------------
 
 def _build_clob_client() -> ClobClient:
-    """Instantiate and return a V2-authenticated ClobClient."""
+    """Instantiate and return a V2-authenticated ClobClient.
+
+    signature_type=POLY_PROXY (1): the EOA owns a Polymarket Proxy deposit
+    wallet. Funds deposited via the Polymarket website live in that proxy;
+    orders must be signed by the EOA on the proxy's behalf.
+    """
     creds = ApiCreds(
         api_key=Config.POLYMARKET_API_KEY,
         api_secret=Config.POLYMARKET_API_SECRET,
         api_passphrase=Config.POLYMARKET_API_PASSPHRASE,
     )
-    # V2: no signature_type or funder required for EOA wallets
     client = ClobClient(
         host=Config.POLYMARKET_HOST,
         chain_id=Config.CHAIN_ID,
         key=Config.PRIVATE_KEY,
         creds=creds,
+        signature_type=1,   # POLY_PROXY — EOA signs on behalf of deposit wallet
     )
     return client
 
@@ -697,6 +702,39 @@ async def run_live_trader() -> None:
             f"[LIVE] Verify POLYMARKET_HOST, API credentials, and network. Aborting."
         )
         return
+
+    # ── Pre-flight: internal exchange balance check ───────────────────────────
+    # Funds deposited via the Polymarket website live in the proxy wallet ledger.
+    # If that balance is 0 the CLOB will reject every order — abort early.
+    try:
+        from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
+        bal_resp = await asyncio.to_thread(
+            client.get_balance_allowance,
+            BalanceAllowanceParams(asset_type=AssetType.COLLATERAL),
+        )
+        raw_balance = float(bal_resp.get("balance", 0) or 0)
+        DECIMALS = 1_000_000  # pUSD / USDC — 6 decimals
+        internal_balance_usd = raw_balance / DECIMALS
+        print(
+            f"{Fore.CYAN}[LIVE] Internal exchange balance: "
+            f"${internal_balance_usd:.4f} pUSD"
+        )
+        if internal_balance_usd == 0:
+            print(
+                f"\n{Fore.RED}{Style.BRIGHT}"
+                f"[LIVE] ⛔ internal trading account balance is 0. "
+                f"Please execute a deposit flow to clear funds for execution.\n"
+                f"[LIVE] Visit https://polymarket.com and ensure your funds "
+                f"are deposited into the exchange (Cash balance > 0).\n"
+                f"[LIVE] Halting bot — no orders will be placed."
+            )
+            return
+    except Exception as exc:  # pylint: disable=broad-except
+        print(
+            f"{Fore.YELLOW}[LIVE] Could not verify internal balance: "
+            f"{type(exc).__name__}: {exc}  — proceeding with caution."
+        )
+    # ─────────────────────────────────────────────────────────────────────────
 
     last_summary_ts = time.time()
 
