@@ -14,7 +14,9 @@ from colorama import Fore, Style, init
 from eth_account import Account
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
-from py_clob_client.constants import BUY, SELL
+# py_clob_client expects plain strings for order side — not module-level constants
+BUY = "BUY"
+SELL = "SELL"
 
 from config import Config
 from signal_engine import SIGNAL_HISTORY
@@ -272,8 +274,8 @@ async def _place_order(signal: dict, size_usd: float) -> dict | None:
         return None
 
     except Exception as exc:  # pylint: disable=broad-except
-        # Suppress message — py-clob-client exceptions may embed signing key material
-        print(f"{Fore.RED}[LIVE] Order placement failed: {type(exc).__name__} (details suppressed for security)")
+        # Expose full exception string to allow diagnosis of CLOB rejection reasons
+        print(f"{Fore.RED}[LIVE] Order placement failed: {type(exc).__name__}: {exc}")
         return None
 
     # ---- Validate API response ----
