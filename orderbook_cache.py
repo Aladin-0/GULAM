@@ -313,15 +313,15 @@ async def _heartbeat_loop(ws) -> None:
     while True:
         await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
         try:
-            latency = await asyncio.wait_for(
-                ws.ping(),
-                timeout=HEARTBEAT_PONG_TIMEOUT_SECONDS,
-            )
-            # ws.ping() returns a coroutine/future that resolves to round-trip time
-            # in seconds (float) once the pong is received.
+            # ws.ping() returns an asyncio.Future that resolves to None when
+            # the pong frame is received.  We must await the Future itself
+            # (not pass the unawaited call) inside asyncio.wait_for so the
+            # timeout fires correctly.  The resolved value is None — there is
+            # no RTT float available from the websockets library.
+            pong_waiter = ws.ping()
+            await asyncio.wait_for(pong_waiter, timeout=HEARTBEAT_PONG_TIMEOUT_SECONDS)
             print(
-                f"{Fore.CYAN}[ORDERBOOK] 💓 Heartbeat OK — "
-                f"pong received (rtt≈{latency * 1000:.1f} ms)"
+                f"{Fore.CYAN}[ORDERBOOK] 💓 Heartbeat OK — pong received."
             )
         except asyncio.TimeoutError:
             print(
