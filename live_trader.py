@@ -45,10 +45,22 @@ init(autoreset=True)
 def _build_clob_client() -> ClobClient:
     """Instantiate and return a V2-authenticated ClobClient.
 
-    signature_type=POLY_PROXY (1): the EOA owns a Polymarket Proxy deposit
-    wallet. Funds deposited via the Polymarket website live in that proxy;
-    orders must be signed by the EOA on the proxy's behalf.
+    signature_type=POLY_PROXY (1): the EOA signs orders on behalf of the
+    Polymarket deposit/proxy wallet (funder). The funder address is read from
+    POLYMARKET_PROXY_WALLET in .env (populated by running find_proxy.py).
+    If not set, falls back to EOA — but orders will likely be rejected.
     """
+    import os as _os
+    proxy_wallet: str = _os.getenv("POLYMARKET_PROXY_WALLET", "").strip()
+    if proxy_wallet:
+        print(f"{Fore.CYAN}[LIVE] Proxy wallet (funder): {proxy_wallet}")
+    else:
+        print(
+            f"{Fore.YELLOW}[LIVE] ⚠️  POLYMARKET_PROXY_WALLET not set in .env. "
+            f"Run find_proxy.py to discover it. Falling back to EOA address — "
+            f"orders may be rejected."
+        )
+
     creds = ApiCreds(
         api_key=Config.POLYMARKET_API_KEY,
         api_secret=Config.POLYMARKET_API_SECRET,
@@ -59,7 +71,8 @@ def _build_clob_client() -> ClobClient:
         chain_id=Config.CHAIN_ID,
         key=Config.PRIVATE_KEY,
         creds=creds,
-        signature_type=1,   # POLY_PROXY — EOA signs on behalf of deposit wallet
+        signature_type=1,                              # POLY_PROXY
+        funder=proxy_wallet if proxy_wallet else None, # deposit wallet address
     )
     return client
 
