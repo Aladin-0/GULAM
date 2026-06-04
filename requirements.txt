@@ -1,5 +1,5 @@
 
-py-clob-client==0.18.0
+py-clob-client==0.34.6
 py-order-utils
 websockets==12.0
 aiohttp==3.9.5
