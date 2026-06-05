@@ -336,22 +336,24 @@ async def _place_order(signal: dict, size_usd: float) -> dict | None:
                 pass
     entry_price: float = round(
         min(_taker_price, Config.MAX_TOKEN_PRICE),
-        4,
+        2,   # CLOB tick size = 0.01 — price must be 2dp
     )
     # ─────────────────────────────────────────────────────────────────────────
 
     # ── CLOB precision gate ───────────────────────────────────────────────────
     # Polymarket requires: maker_amount (USD spent) max 2dp, size (shares) max 4dp.
-    # Float arithmetic like 6.6353 × 0.85 = 5.640005 violates the 2dp maker rule
-    # even when both inputs are individually rounded.  Decimal gives exact math.
-    _price_d = Decimal(str(entry_price))
-    _usd_d   = Decimal(str(size_usd)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    # price is now exactly 2dp so price × shares cannot exceed 2dp in maker amount.
+    _price_d  = Decimal(str(entry_price))
+    _usd_d    = Decimal(str(size_usd)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
     _shares_d = (_usd_d / _price_d).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
-    # Recompute maker amount from rounded shares to ensure it stays ≤ 2dp
     _maker_d  = (_shares_d * _price_d).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
     shares: float   = float(_shares_d)
     size_usd: float = float(_maker_d)
+    print(
+        f"{Fore.CYAN}[LIVE] Order math → price={entry_price}  "
+        f"shares={shares}  usd=${size_usd:.2f}"
+    )
     # ─────────────────────────────────────────────────────────────────────────
 
     if shares <= 0 or entry_price <= 0:
