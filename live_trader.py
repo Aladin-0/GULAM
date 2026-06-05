@@ -673,32 +673,65 @@ def _record_settlement(condition_id: str, exit_price: float, reason: str) -> Non
 # Position monitor
 # ---------------------------------------------------------------------------
 
-async def _fetch_actual_payout(token_id: str, order_id: str) -> float | None:
+async def _fetch_actual_payout(token_id: str, order_id: str, position: dict) -> float | None:
     """
-    Query Polymarket CLOB trades API to get the REAL exit/payout price for a filled position.
+    Determine the REAL outcome of a settled Polymarket position.
 
-    Returns 1.0 (win) or 0.0 (loss) based on actual redemption data,
-    or None if the data is not yet available (defer to next cycle).
-    This replaces the broken oracle-price guessing approach.
+    Strategy (in order of reliability):
+      1. Oracle price vs price_to_beat — fast, accurate once market ends.
+      2. CLOB get_trades(TradeParams) — confirms via on-chain trade records.
+      3. CLOB get_order(order_id)    — last resort status check.
+
+    Returns 1.0 (win), 0.0 (loss), or None (not yet settled — defer).
     """
+    from oracle import LATEST_PRICES
+
+    # ── Method 1: Oracle price vs price_to_beat (most reliable) ──────────────
+    # Once the 15-min market closes, oracle IS the settlement price.
+    oracle_key = f"{position['symbol'].lower()}/usd"
+    oracle_entry = LATEST_PRICES.get(oracle_key, {})
+    oracle_price: float = oracle_entry.get("price", 0.0)
+    ptb: float = position.get("price_to_beat", 0.0)
+
+    if oracle_price > 0 and ptb > 0:
+        if position["side"] == "UP":
+            is_win = oracle_price > ptb
+        else:
+            is_win = oracle_price < ptb
+        result = 1.0 if is_win else 0.0
+        print(
+            f"{Fore.CYAN}[LIVE] Oracle settlement: {position['symbol'].upper()} "
+            f"{position['side']} | price={oracle_price:.2f} ptb={ptb:.2f} "
+            f"→ {'WIN ✅' if is_win else 'LOSS ❌'}"
+        )
+        return result
+
+    # ── Method 2: CLOB get_trades with correct TradeParams ───────────────────
     client = _get_client()
     try:
-        # Fetch recent trades for this token from Polymarket
+        from py_clob_client_v2.clob_types import TradeParams
+        params = TradeParams(asset_id=token_id)
         trades_resp = await asyncio.wait_for(
-            asyncio.to_thread(client.get_trades, {"maker_order_id": order_id}),
+            asyncio.to_thread(client.get_trades, params),
             timeout=10.0,
         )
         if isinstance(trades_resp, list) and trades_resp:
-            # Check if any trade shows this position was redeemed/settled
             for trade in trades_resp:
                 trade_type = str(trade.get("type", "")).upper()
-                if trade_type in ("REDEMPTION", "SETTLEMENT"):
-                    # Market resolved — check the price
+                if trade_type in ("REDEMPTION", "SETTLEMENT", "REDEEM"):
                     price = float(trade.get("price", -1))
                     if price >= 0:
-                        return 1.0 if price >= 0.99 else 0.0
+                        result = 1.0 if price >= 0.99 else 0.0
+                        print(
+                            f"{Fore.CYAN}[LIVE] Trade API: type={trade_type} "
+                            f"price={price:.4f} → {'WIN ✅' if result >= 0.99 else 'LOSS ❌'}"
+                        )
+                        return result
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f"{Fore.YELLOW}[LIVE] Trade API error: {type(exc).__name__} — trying order status...")
 
-        # Fallback: check via get_order to see final matched price
+    # ── Method 3: get_order status ────────────────────────────────────────────
+    try:
         order_resp = await asyncio.wait_for(
             asyncio.to_thread(client.get_order, order_id),
             timeout=10.0,
@@ -709,7 +742,8 @@ async def _fetch_actual_payout(token_id: str, order_id: str) -> float | None:
                 outcome = order_resp.get("outcome", "").upper()
                 return 1.0 if outcome == "WIN" else 0.0
     except Exception as exc:  # pylint: disable=broad-except
-        print(f"{Fore.YELLOW}[LIVE] Payout check error: {type(exc).__name__} — will retry.")
+        print(f"{Fore.YELLOW}[LIVE] Order status error: {type(exc).__name__}")
+
     return None  # Not settled yet — defer
 
 
@@ -749,7 +783,7 @@ async def _monitor_live_positions() -> None:
             # ── REAL PAYOUT CHECK (the core fix) ─────────────────────────────
             # Ask Polymarket directly: did this position win or lose?
             # This is the ONLY source of truth — not oracle, not token price.
-            actual_payout = await _fetch_actual_payout(token_id, order_id)
+            actual_payout = await _fetch_actual_payout(token_id, order_id, position)
 
             if actual_payout is not None:
                 exit_price = actual_payout   # 1.0 = win, 0.0 = loss
