@@ -413,7 +413,7 @@ async def _open_live_position(signal: dict) -> None:
     # ── FILL VERIFICATION (the critical fix) ─────────────────────────────────
     # Do NOT record a position until Polymarket confirms the order was matched.
     # This prevents the bot from counting unfilled orders as real positions.
-    filled_shares = await _verify_order_filled(order_id, signal["token_id"], max_wait=30.0)
+    filled_shares = await _verify_order_filled(order_id, signal["token_id"], max_wait=60.0)
     if filled_shares <= 0:
         print(
             f"{Fore.RED}[LIVE] ✗ Order NOT FILLED — {signal['symbol'].upper()} {signal['side']} "
