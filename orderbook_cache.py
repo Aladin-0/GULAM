@@ -343,18 +343,46 @@ async def _ws_worker() -> None:
         attempt 3 → 4s
         attempt 4 → 8s
         attempt 5+ → 60s (cap)
+
+    Boot handshake sequence (aggressive pre-fetch fix):
+        1. Poll scanner every second until at least one token is available.
+        2. Seed ALL token snapshots from REST before opening the WebSocket.
+        3. Connect WebSocket and subscribe to all tokens.
+        4. Re-seed any tokens that the scanner added between step 1 and step 3.
+        5. Mark _WS_CONNECTED = True — signal engine is now unblocked.
     """
     global _SUBSCRIBED_TOKENS, _WS_CONNECTED
 
     reconnect_delay: float = BACKOFF_BASE_SECONDS
 
     while True:
-        # Determine target token IDs from current active markets
-        target_tokens = _token_ids_from_markets()
-        if target_tokens:
-            # Seed snapshots before connecting so the cache is ready immediately
-            # after handshake, not after the first delta burst.
-            await _seed_snapshots(target_tokens)
+        # ── Step 1: Wait for scanner to publish at least one token ───────────
+        # At process startup the scanner may not have completed its first REST
+        # poll yet.  We loop here until there is something to subscribe to,
+        # rather than connecting with an empty subscription list and relying on
+        # the lazy _maintenance_loop (which only runs every 5 seconds) to pick
+        # them up later.
+        target_tokens: set[str] = set()
+        _seed_wait_logged = False
+        while not target_tokens:
+            target_tokens = _token_ids_from_markets()
+            if not target_tokens:
+                if not _seed_wait_logged:
+                    print(
+                        f"{Fore.YELLOW}[ORDERBOOK] ⏳ Waiting for scanner to publish "
+                        f"token IDs before seeding snapshots..."
+                    )
+                    _seed_wait_logged = True
+                await asyncio.sleep(1)
+        print(
+            f"{Fore.GREEN}[ORDERBOOK] 🔍 Scanner ready — "
+            f"{len(target_tokens)} token(s) found. Pre-seeding all snapshots..."
+        )
+
+        # ── Step 2: Seed ALL snapshots aggressively before WS connect ────────
+        # Fires all REST snapshot fetches concurrently so the cache is fully
+        # populated before the first signal evaluation can ever run.
+        await _seed_snapshots(target_tokens)
 
         try:
             print(
@@ -371,7 +399,7 @@ async def _ws_worker() -> None:
                 await asyncio.sleep(0.5)  # let handshake stabilize
                 print(f"{Fore.GREEN}[ORDERBOOK] ✅ WS connected.")
 
-                # Subscribe to all token IDs
+                # ── Step 3: Subscribe to all known tokens ─────────────────────
                 if target_tokens:
                     sub_msg = {"assets": list(target_tokens), "type": "market"}
                     await ws.send(json.dumps(sub_msg))
@@ -381,7 +409,25 @@ async def _ws_worker() -> None:
                         f"{len(target_tokens)} token(s)."
                     )
 
-                # Mark the WebSocket as live — signals may now be generated.
+                # ── Step 4: Re-seed any tokens added during WS handshake ──────
+                # Between step 1 and step 3 the scanner may have added new
+                # markets.  Catch them now so nothing is missed before the
+                # _maintenance_loop takes over.
+                fresh_tokens = _token_ids_from_markets() - _SUBSCRIBED_TOKENS
+                if fresh_tokens:
+                    print(
+                        f"{Fore.GREEN}[ORDERBOOK] Post-connect re-seed: "
+                        f"{len(fresh_tokens)} new token(s) found during handshake."
+                    )
+                    await _seed_snapshots(fresh_tokens)
+                    extra_sub = {"assets": list(fresh_tokens), "type": "market"}
+                    try:
+                        await ws.send(json.dumps(extra_sub))
+                        _SUBSCRIBED_TOKENS.update(fresh_tokens)
+                    except Exception:
+                        pass  # _maintenance_loop will retry in 5s
+
+                # ── Step 5: Mark WS live — signal engine unblocked ────────────
                 _WS_CONNECTED = True
                 reconnect_delay = BACKOFF_BASE_SECONDS  # reset backoff on success
 
