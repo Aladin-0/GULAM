@@ -46,7 +46,7 @@ class _Config:
 
     # --- Signal Filter ---
     BASE_GAP_BPS: float = float(os.getenv("BASE_GAP_BPS", "100.0"))
-    MAX_TOKEN_PRICE: float = float(os.getenv("MAX_TOKEN_PRICE", "0.85"))
+    MAX_TOKEN_PRICE: float = float(os.getenv("MAX_TOKEN_PRICE", "0.75"))
     MIN_PRICE_MOVE_PCT: float = float(os.getenv("MIN_PRICE_MOVE_PCT", "0.25"))
     MIN_TIME_REMAINING_MINUTES: int = int(os.getenv("MIN_TIME_REMAINING_MINUTES", "5"))
 
