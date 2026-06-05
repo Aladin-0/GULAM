@@ -7,6 +7,7 @@ sign (ECDSA via private key), and broadcast real limit orders.
 
 import asyncio
 import time
+import math
 from datetime import date
 from decimal import Decimal, ROUND_DOWN
 
@@ -342,14 +343,21 @@ async def _place_order(signal: dict, size_usd: float) -> dict | None:
 
     # ── CLOB precision gate ───────────────────────────────────────────────────
     # Polymarket requires: maker_amount (USD spent) max 2dp, size (shares) max 4dp.
-    # price is now exactly 2dp so price × shares cannot exceed 2dp in maker amount.
-    _price_d  = Decimal(str(entry_price))
-    _usd_d    = Decimal(str(size_usd)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-    _shares_d = (_usd_d / _price_d).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
-    _maker_d  = (_shares_d * _price_d).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    # We must find a share amount that results in exactly a 2-decimal USD cost.
+    def calculate_aligned_shares(usd_capital: float, price: float) -> float:
+        if price <= 0: return 0.0
+        p_int = int(round(price * 10000))
+        step = 1000000 // math.gcd(p_int, 1000000)
+        ideal_shares = usd_capital / price
+        ideal_k = int(ideal_shares * 10000)
+        valid_k = (ideal_k // step) * step
+        if valid_k == 0:
+            valid_k = step
+        return valid_k / 10000.0
 
-    shares: float   = float(_shares_d)
-    size_usd: float = float(_maker_d)
+    shares: float = calculate_aligned_shares(size_usd, entry_price)
+    size_usd: float = round(shares * entry_price, 2)
+
     print(
         f"{Fore.CYAN}[LIVE] Order math → price={entry_price}  "
         f"shares={shares}  usd=${size_usd:.2f}"
