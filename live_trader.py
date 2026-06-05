@@ -255,6 +255,47 @@ def _compute_position_size() -> float:
     return total_equity * Config.MAX_POSITION_SIZE_PCT
 
 
+async def _verify_order_filled(order_id: str, token_id: str, max_wait: float = 30.0) -> float:
+    """
+    Poll the CLOB to confirm an order was actually FILLED.
+
+    Returns the filled size (shares) if confirmed filled, or 0.0 if the order
+    was cancelled, expired, or still open after max_wait seconds.
+    This is the KEY guard: we only record a position after Polymarket confirms the fill.
+    """
+    client = _get_client()
+    deadline = time.time() + max_wait
+    poll_interval = 3.0
+
+    while time.time() < deadline:
+        try:
+            order_resp = await asyncio.wait_for(
+                asyncio.to_thread(client.get_order, order_id),
+                timeout=10.0,
+            )
+            if isinstance(order_resp, dict):
+                status = order_resp.get("status", "").upper()
+                size_matched = float(order_resp.get("size_matched", 0) or 0)
+                if status in ("MATCHED", "FILLED") or size_matched > 0:
+                    return size_matched
+                if status in ("CANCELLED", "EXPIRED", "UNMATCHED"):
+                    print(
+                        f"{Fore.YELLOW}[LIVE] Order {order_id[:16]}... status={status} — NOT filled. "
+                        f"No position recorded. Capital returned."
+                    )
+                    return 0.0
+        except Exception as exc:  # pylint: disable=broad-except
+            print(f"{Fore.YELLOW}[LIVE] Fill check error: {type(exc).__name__} — retrying...")
+
+        await asyncio.sleep(poll_interval)
+
+    print(
+        f"{Fore.YELLOW}[LIVE] Order {order_id[:16]}... fill unconfirmed after {max_wait:.0f}s — "
+        f"treating as NOT filled. Check Polymarket dashboard."
+    )
+    return 0.0
+
+
 async def _place_order(signal: dict, size_usd: float) -> dict | None:
     """
     Construct, sign and POST a GTC limit order to the Polymarket CLOB.
@@ -312,7 +353,6 @@ async def _place_order(signal: dict, size_usd: float) -> dict | None:
 
     # ---- Validate API response ----
     if not isinstance(resp, dict):
-        # Truncate repr — raw CLOB responses may echo auth tokens in error payloads
         safe_resp = str(resp)[:120] if resp is not None else "None"
         print(f"{Fore.RED}[LIVE] Unexpected response type from CLOB: {safe_resp}...")
         return None
@@ -323,7 +363,6 @@ async def _place_order(signal: dict, size_usd: float) -> dict | None:
             f"{Fore.RED}[LIVE] Order REJECTED by CLOB: {error_msg}  "
             f"(token={token_id[:12]}...  price={entry_price}  size={shares})"
         )
-        # Surface specific actionable errors
         if "insufficient" in str(error_msg).lower():
             print(
                 f"{Fore.RED}[LIVE] Insufficient USDC balance or liquidity. "
@@ -333,11 +372,11 @@ async def _place_order(signal: dict, size_usd: float) -> dict | None:
 
     order_id = resp.get("orderID", resp.get("order_id", "N/A"))
     print(
-        f"{Fore.GREEN}{Style.BRIGHT}[LIVE] ✓ Order ACCEPTED — "
+        f"{Fore.GREEN}{Style.BRIGHT}[LIVE] ✓ Order SUBMITTED — "
         f"orderID={order_id}  "
         f"token={token_id[:12]}...  "
         f"price={entry_price}  shares={shares:.4f}  "
-        f"size_usd=${size_usd:.2f}"
+        f"size_usd=${size_usd:.2f}  (awaiting fill confirmation...)"
     )
     return resp
 
@@ -347,7 +386,7 @@ async def _place_order(signal: dict, size_usd: float) -> dict | None:
 # ---------------------------------------------------------------------------
 
 async def _open_live_position(signal: dict) -> None:
-    """Attempt to place a live order and record the position on success."""
+    """Attempt to place a live order and record the position ONLY after fill is confirmed."""
     condition_id = signal["condition_id"]
 
     if condition_id in LIVE_STATE["open_positions"]:
@@ -369,9 +408,24 @@ async def _open_live_position(signal: dict) -> None:
     if resp is None:
         return  # order failed — no state change
 
-    shares = size_usd / entry_price
+    order_id = resp.get("orderID", resp.get("order_id", ""))
+
+    # ── FILL VERIFICATION (the critical fix) ─────────────────────────────────
+    # Do NOT record a position until Polymarket confirms the order was matched.
+    # This prevents the bot from counting unfilled orders as real positions.
+    filled_shares = await _verify_order_filled(order_id, signal["token_id"], max_wait=30.0)
+    if filled_shares <= 0:
+        print(
+            f"{Fore.RED}[LIVE] ✗ Order NOT FILLED — {signal['symbol'].upper()} {signal['side']} "
+            f"skipped. No position recorded. Capital unchanged."
+        )
+        return
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # Use actual filled shares (may differ from requested due to partial fills)
+    shares = filled_shares
     cost = shares * entry_price
-    clob_entry_fee = cost * Config.CLOB_FEE_PCT   # Polymarket maker/taker fee on entry fill
+    clob_entry_fee = cost * Config.CLOB_FEE_PCT
 
     position = {
         "condition_id": condition_id,
@@ -384,10 +438,10 @@ async def _open_live_position(signal: dict) -> None:
         "price_to_beat": signal.get("price_to_beat", 0.0),
         "shares": shares,
         "cost": cost,
-        "clob_entry_fee": clob_entry_fee,          # persisted so recovery sees the real cost basis
+        "clob_entry_fee": clob_entry_fee,
         "entry_time": time.time(),
         "time_remaining": signal["time_remaining"],
-        "order_id": resp.get("orderID", ""),
+        "order_id": order_id,
     }
 
     LIVE_STATE["open_positions"][condition_id] = position
@@ -402,7 +456,7 @@ async def _open_live_position(signal: dict) -> None:
     _live_persist_state()
 
     print(
-        f"{Fore.YELLOW}[LIVE] Position recorded: "
+        f"{Fore.GREEN}[LIVE] ✅ Position CONFIRMED FILLED: "
         f"[{signal['symbol'].upper()}] {signal['side']}  "
         f"shares={shares:.4f}  entry={entry_price:.4f}  cost=${cost:.2f}  "
         f"clob_fee=${clob_entry_fee:.4f}  "
@@ -619,61 +673,109 @@ def _record_settlement(condition_id: str, exit_price: float, reason: str) -> Non
 # Position monitor
 # ---------------------------------------------------------------------------
 
+async def _fetch_actual_payout(token_id: str, order_id: str) -> float | None:
+    """
+    Query Polymarket CLOB trades API to get the REAL exit/payout price for a filled position.
+
+    Returns 1.0 (win) or 0.0 (loss) based on actual redemption data,
+    or None if the data is not yet available (defer to next cycle).
+    This replaces the broken oracle-price guessing approach.
+    """
+    client = _get_client()
+    try:
+        # Fetch recent trades for this token from Polymarket
+        trades_resp = await asyncio.wait_for(
+            asyncio.to_thread(client.get_trades, {"maker_order_id": order_id}),
+            timeout=10.0,
+        )
+        if isinstance(trades_resp, list) and trades_resp:
+            # Check if any trade shows this position was redeemed/settled
+            for trade in trades_resp:
+                trade_type = str(trade.get("type", "")).upper()
+                if trade_type in ("REDEMPTION", "SETTLEMENT"):
+                    # Market resolved — check the price
+                    price = float(trade.get("price", -1))
+                    if price >= 0:
+                        return 1.0 if price >= 0.99 else 0.0
+
+        # Fallback: check via get_order to see final matched price
+        order_resp = await asyncio.wait_for(
+            asyncio.to_thread(client.get_order, order_id),
+            timeout=10.0,
+        )
+        if isinstance(order_resp, dict):
+            status = order_resp.get("status", "").upper()
+            if status in ("REDEEMED", "SETTLED"):
+                outcome = order_resp.get("outcome", "").upper()
+                return 1.0 if outcome == "WIN" else 0.0
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f"{Fore.YELLOW}[LIVE] Payout check error: {type(exc).__name__} — will retry.")
+    return None  # Not settled yet — defer
+
+
 async def _monitor_live_positions() -> None:
-    """Check age of open positions; force-settle expired ones conservatively."""
-    from oracle import LATEST_PRICES
+    """Check age of open positions; settle only after verifying actual Polymarket payout."""
     from scanner import get_active_markets
 
     active_markets = get_active_markets()
     to_settle: list[tuple[str, float, str]] = []
 
-    for condition_id, position in LIVE_STATE["open_positions"].items():
+    for condition_id, position in list(LIVE_STATE["open_positions"].items()):
         elapsed = time.time() - position["entry_time"]
+        sym = position.get("symbol", "?").upper()
+        cid_short = condition_id[:8]
 
-        # --- Hard age limit ---
+        # --- Hard age limit (safety net only) ---
         if elapsed > Config.MAX_POSITION_AGE_SECONDS:
-            sym = position.get("symbol", "?").upper()
             print(
                 f"{Fore.RED}[LIVE] FORCE EXPIRED: {sym} held "
-                f"{int(elapsed // 60)}min — settling conservatively."
+                f"{int(elapsed // 60)}min — settling conservatively as LOSS."
             )
             to_settle.append((condition_id, 0.0, "expired_unresolved"))
             continue
 
+        # Market is no longer active — check if Polymarket settled it
         if condition_id not in active_markets:
-            oracle_key = f"{position['symbol'].lower()}/usd"
-            oracle_entry = LATEST_PRICES.get(oracle_key, {})
-            oracle_price: float = oracle_entry.get("price", 0.0)
-            ptb: float = position.get("price_to_beat", 0.0)
+            order_id = position.get("order_id", "")
+            token_id = position.get("token_id", "")
 
-            if oracle_price > 0 and ptb > 0:
-                # Oracle data available — resolve mathematically (mirrors paper_trader)
-                if position["side"] == "UP":
-                    is_win = oracle_price > ptb
-                else:
-                    is_win = oracle_price < ptb
-                exit_price = 1.0 if is_win else 0.0
-                reason = "settled_win" if is_win else "settled_loss"
+            if not order_id:
+                # No order_id stored (legacy position) — fall back to conservative loss
+                print(f"{Fore.YELLOW}[LIVE] {sym} {position['side']} (cid={cid_short}...) "
+                      f"no order_id stored — settling conservatively.")
+                to_settle.append((condition_id, 0.0, "settled_loss"))
+                continue
+
+            # ── REAL PAYOUT CHECK (the core fix) ─────────────────────────────
+            # Ask Polymarket directly: did this position win or lose?
+            # This is the ONLY source of truth — not oracle, not token price.
+            actual_payout = await _fetch_actual_payout(token_id, order_id)
+
+            if actual_payout is not None:
+                exit_price = actual_payout   # 1.0 = win, 0.0 = loss
+                reason = "settled_win" if actual_payout >= 0.99 else "settled_loss"
+                print(
+                    f"{Fore.CYAN}[LIVE] {sym} {position['side']} "
+                    f"— Polymarket confirmed: {'WIN ✅' if actual_payout >= 0.99 else 'LOSS ❌'}"
+                )
                 to_settle.append((condition_id, exit_price, reason))
             else:
-                # --- Oracle not ready: 60-second deferral (mirrors paper_trader exactly) ---
+                # Settlement not confirmed yet — defer with timeout
                 uncertain_at: float | None = position.get("uncertain_resolve_at")
-                cid_short = condition_id[:8]
-                sym = position.get("symbol", "?").upper()
                 if uncertain_at is None:
                     print(
                         f"{Fore.YELLOW}[LIVE] {sym} {position['side']} "
-                        f"(cid={cid_short}...) market gone, "
-                        f"oracle/PTB unavailable → deferring 60s..."
+                        f"(cid={cid_short}...) market ended, awaiting Polymarket settlement..."
                     )
-                    position["uncertain_resolve_at"] = time.time() + 60
-                    _db_save_position(condition_id, position)  # persist deferral timestamp
+                    position["uncertain_resolve_at"] = time.time() + 120  # wait up to 2 min
+                    _db_save_position(condition_id, position)
                 elif time.time() >= uncertain_at:
                     print(
                         f"{Fore.RED}[LIVE] {sym} {position['side']} "
-                        f"(cid={cid_short}...) force-resolved (no oracle data) → LOSS"
+                        f"(cid={cid_short}...) settlement unconfirmed after 2min — recording as LOSS"
                     )
                     to_settle.append((condition_id, 0.0, "settled_loss"))
+            # ─────────────────────────────────────────────────────────────────
 
     for condition_id, exit_price, reason in to_settle:
         _record_settlement(condition_id, exit_price, reason)
