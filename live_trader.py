@@ -8,6 +8,7 @@ sign (ECDSA via private key), and broadcast real limit orders.
 import asyncio
 import time
 from datetime import date
+from decimal import Decimal, ROUND_DOWN
 
 import aiohttp
 from colorama import Fore, Style, init
@@ -339,9 +340,19 @@ async def _place_order(signal: dict, size_usd: float) -> dict | None:
     )
     # ─────────────────────────────────────────────────────────────────────────
 
-    # CLOB precision rules: maker amount (USD) max 2dp, taker amount (shares) max 4dp
-    size_usd = round(size_usd, 2)
-    shares: float = round(size_usd / entry_price, 4)
+    # ── CLOB precision gate ───────────────────────────────────────────────────
+    # Polymarket requires: maker_amount (USD spent) max 2dp, size (shares) max 4dp.
+    # Float arithmetic like 6.6353 × 0.85 = 5.640005 violates the 2dp maker rule
+    # even when both inputs are individually rounded.  Decimal gives exact math.
+    _price_d = Decimal(str(entry_price))
+    _usd_d   = Decimal(str(size_usd)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    _shares_d = (_usd_d / _price_d).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
+    # Recompute maker amount from rounded shares to ensure it stays ≤ 2dp
+    _maker_d  = (_shares_d * _price_d).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+    shares: float   = float(_shares_d)
+    size_usd: float = float(_maker_d)
+    # ─────────────────────────────────────────────────────────────────────────
 
     if shares <= 0 or entry_price <= 0:
         print(f"{Fore.RED}[LIVE] Invalid order params: shares={shares} price={entry_price}")
