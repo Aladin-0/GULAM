@@ -339,6 +339,8 @@ async def _place_order(signal: dict, size_usd: float) -> dict | None:
     )
     # ─────────────────────────────────────────────────────────────────────────
 
+    # CLOB precision rules: maker amount (USD) max 2dp, taker amount (shares) max 4dp
+    size_usd = round(size_usd, 2)
     shares: float = round(size_usd / entry_price, 4)
 
     if shares <= 0 or entry_price <= 0:
