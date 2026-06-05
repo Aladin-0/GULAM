@@ -192,6 +192,11 @@ def get_open_positions() -> dict:
     return LIVE_STATE["open_positions"]
 
 
+def get_live_capital() -> float:
+    """Return current live capital (USD).  Called by signal_engine via callback."""
+    return LIVE_STATE["capital"]
+
+
 def get_performance_summary() -> dict:
     total = LIVE_STATE["total_trades"]
     win_rate = LIVE_STATE["winning_trades"] / total if total > 0 else 0.0
@@ -302,9 +307,35 @@ async def _place_order(signal: dict, size_usd: float) -> dict | None:
 
     Returns the API response dict on success, or None on any failure.
     A None return means NO order was sent — capital is safe.
+
+    Fix #2 — Aggressive Taker Execution:
+      Instead of placing at the Gamma REST snapshot price (maker order that
+      waits for a counterparty), we cross the spread by targeting the live
+      best-ask from the CLOB WebSocket cache, then adding a small slippage
+      buffer (+0.005) so our order sits above all resting asks and executes
+      immediately as a taker.  The result is capped at MAX_TOKEN_PRICE.
     """
     token_id: str = signal["token_id"]
-    entry_price: float = round(signal["entry_price"], 4)
+
+    # ── Live taker price (Fix #2) ─────────────────────────────────────────────
+    _snapshot_price: float = signal["entry_price"]  # Gamma REST fallback
+    _taker_price: float = _snapshot_price
+    book = clob_cache.get_orderbook(token_id)
+    if book is not None:
+        asks = book.get("asks", {})
+        if asks:
+            try:
+                best_ask = min(float(p) for p in asks)
+                if 0.0 < best_ask < 1.0:
+                    _taker_price = best_ask + 0.005  # cross the spread aggressively
+            except (ValueError, TypeError):
+                pass
+    entry_price: float = round(
+        min(_taker_price, Config.MAX_TOKEN_PRICE),
+        4,
+    )
+    # ─────────────────────────────────────────────────────────────────────────
+
     shares: float = round(size_usd / entry_price, 4)
 
     if shares <= 0 or entry_price <= 0:
@@ -819,7 +850,7 @@ async def _monitor_live_positions() -> None:
 # Main loop
 # ---------------------------------------------------------------------------
 
-async def run_live_trader() -> None:
+async def run_live_trader(queue: asyncio.Queue) -> None:
     """Live execution loop. Public coroutine for main.py."""
     global _last_processed_index
 
@@ -938,43 +969,57 @@ async def run_live_trader() -> None:
 
     last_summary_ts = time.time()
 
-    while True:
-        try:
-            _maybe_daily_reset()
+    # ── Fix #1: Queue-based consumer — replaces 5-second polling loop ─────────
+    # Two concurrent tasks share this function:
+    #   1. _signal_consumer: blocks on queue.get(), processes signals with zero lag
+    #   2. _position_monitor: periodic settlement checks + daily summary
+    # Both are gathered here inside run_live_trader so they share all local state.
 
-            if not _trading_halted:
-                new_signals = SIGNAL_HISTORY[_last_processed_index:]
-                _last_processed_index = len(SIGNAL_HISTORY)
+    async def _signal_consumer() -> None:
+        """Consume signals from the shared asyncio.Queue as they arrive."""
+        while True:
+            signal = await queue.get()
+            try:
+                _maybe_daily_reset()
+                if not _trading_halted and not _check_daily_loss_limit():
+                    await _open_live_position(signal)
+            except Exception as exc:  # pylint: disable=broad-except
+                print(f"{Fore.RED}[LIVE] Error processing signal: {type(exc).__name__} (details suppressed)")
+            finally:
+                queue.task_done()
 
-                if not _check_daily_loss_limit():
-                    for signal in new_signals:
-                        await _open_live_position(signal)
+    async def _position_monitor() -> None:
+        """Background task: settle positions and print periodic summaries."""
+        nonlocal last_summary_ts
+        while True:
+            try:
+                _maybe_daily_reset()
+                if LIVE_STATE["open_positions"]:
+                    await _monitor_live_positions()
+                _check_daily_loss_limit()
 
-            if LIVE_STATE["open_positions"]:
-                await _monitor_live_positions()
+                if time.time() - last_summary_ts >= SUMMARY_INTERVAL_SECONDS:
+                    summary = get_performance_summary()
+                    sign = "+" if summary["total_profit"] >= 0 else ""
+                    print(
+                        f"\n{Fore.CYAN}{Style.BRIGHT}[LIVE] ══ LIVE PERFORMANCE ══\n"
+                        f"{Fore.CYAN}  Capital    : ${summary['capital']:.2f}\n"
+                        f"{Fore.CYAN}  Total P&L  : {sign}{summary['total_profit']:.4f}\n"
+                        f"{Fore.CYAN}  Win Rate   : {summary['win_rate'] * 100:.1f}% "
+                        f"({summary['total_trades']} trades)\n"
+                        f"{Fore.CYAN}  Open       : {summary['open_positions']} position(s)\n"
+                    )
+                    last_summary_ts = time.time()
+            except Exception as exc:  # pylint: disable=broad-except
+                print(f"{Fore.RED}[LIVE] Monitor error: {type(exc).__name__} (details suppressed)")
+            await asyncio.sleep(MONITOR_INTERVAL_SECONDS)
 
-            _check_daily_loss_limit()
-
-            if time.time() - last_summary_ts >= SUMMARY_INTERVAL_SECONDS:
-                summary = get_performance_summary()
-                sign = "+" if summary["total_profit"] >= 0 else ""
-                print(
-                    f"\n{Fore.CYAN}{Style.BRIGHT}[LIVE] ══ LIVE PERFORMANCE ══\n"
-                    f"{Fore.CYAN}  Capital    : ${summary['capital']:.2f}\n"
-                    f"{Fore.CYAN}  Total P&L  : {sign}{summary['total_profit']:.4f}\n"
-                    f"{Fore.CYAN}  Win Rate   : {summary['win_rate'] * 100:.1f}% "
-                    f"({summary['total_trades']} trades)\n"
-                    f"{Fore.CYAN}  Open       : {summary['open_positions']} position(s)\n"
-                )
-                last_summary_ts = time.time()
-
-        except Exception as exc:  # pylint: disable=broad-except
-            # Suppress exc message — library exceptions may embed key material
-            print(f"{Fore.RED}[LIVE] Unexpected error in main loop: {type(exc).__name__} (details suppressed)")
-
-        await asyncio.sleep(MONITOR_INTERVAL_SECONDS)
+    await asyncio.gather(
+        _signal_consumer(),
+        _position_monitor(),
+    )
 
 
 if __name__ == "__main__":
     Config.summary()
-    asyncio.run(run_live_trader())
+    asyncio.run(run_live_trader(asyncio.Queue()))

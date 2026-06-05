@@ -17,6 +17,7 @@ from signal_engine import (
     run_signal_engine,
     register_hedge_callback,
     register_positions_callback,
+    register_capital_callback,
 )
 
 init(autoreset=True)
@@ -42,6 +43,7 @@ if Config.PAPER_TRADING:
         run_paper_trader as _run_trader,
         execute_hedge_dump as _trader_hedge_dump,
         get_open_positions as _trader_get_positions,
+        get_live_capital as _trader_get_capital,
     )
     _TRADER_NAME = "paper_trader"
 else:
@@ -50,22 +52,16 @@ else:
         run_live_trader as _run_trader,
         execute_hedge_dump as _trader_hedge_dump,
         get_open_positions as _trader_get_positions,
+        get_live_capital as _trader_get_capital,
     )
     _TRADER_NAME = "live_trader"
 
-# Maps a task name to its coroutine factory for the Execution Engine group
-_TASK_FACTORIES: dict[str, callable] = {
-    "oracle": run_oracle,
-    "scanner": run_scanner,
-    "signal_engine": run_signal_engine,
-    _TRADER_NAME: _run_trader,
-}
-
-# Register the escape-hatch callbacks with the signal engine.
+# Register the escape-hatch and capital callbacks with the signal engine.
 # Done here (post-import) to avoid circular imports between signal_engine
-# and the trader modules.  Both callbacks are injected once at process start.
+# and the trader modules.  All callbacks are injected once at process start.
 register_hedge_callback(_trader_hedge_dump)
 register_positions_callback(_trader_get_positions)
+register_capital_callback(_trader_get_capital)
 
 
 
@@ -186,11 +182,26 @@ async def _run_orderbook_synchronizer() -> None:
 
 async def _run_execution_engine() -> None:
     """Group B: High-speed Signal / Execution Engine."""
+    # Single shared queue: signal_engine PUTs, trader GETs — zero polling lag.
+    execution_queue: asyncio.Queue = asyncio.Queue()
+
     tasks = [
-        asyncio.create_task(_supervised(name, factory), name=name)
-        for name, factory in _TASK_FACTORIES.items()
+        asyncio.create_task(
+            _supervised("oracle", run_oracle), name="oracle"
+        ),
+        asyncio.create_task(
+            _supervised("scanner", run_scanner), name="scanner"
+        ),
+        asyncio.create_task(
+            _supervised("signal_engine", lambda: run_signal_engine(execution_queue)),
+            name="signal_engine",
+        ),
+        asyncio.create_task(
+            _supervised(_TRADER_NAME, lambda: _run_trader(execution_queue)),
+            name=_TRADER_NAME,
+        ),
+        asyncio.create_task(_stats_loop(), name="stats"),
     ]
-    tasks.append(asyncio.create_task(_stats_loop(), name="stats"))
     await asyncio.gather(*tasks)
 
 

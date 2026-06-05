@@ -53,6 +53,10 @@ _hedge_callback: "callable | None" = None
 # Signature: def positions_fn() -> dict[str, dict]
 _get_open_positions_fn: "callable | None" = None
 
+# Injected at startup by main.py via register_capital_callback().
+# Signature: def capital_fn() -> float
+_get_capital_fn: "callable | None" = None
+
 # ---------------------------------------------------------------------------
 # Set of condition_ids already signaled this hour
 # ---------------------------------------------------------------------------
@@ -103,17 +107,25 @@ def register_hedge_callback(fn: "callable") -> None:
 
 
 def register_positions_callback(fn: "callable") -> None:
-    """Register a synchronous getter that returns the trader's open positions dict.
-
-    Called once at startup (main.py).  Used by the escape-hatch loop to read the
-    active positions from whichever trader (paper or live) is running.
-
-    ``fn`` must be a synchronous callable with signature:
-        def fn() -> dict[str, dict]   # condition_id -> position dict
-    """
+    """Register a synchronous getter that returns the trader's open positions dict."""
     global _get_open_positions_fn
     _get_open_positions_fn = fn
     print(f"{Fore.CYAN}[SIGNAL] Positions callback registered: {getattr(fn, '__qualname__', repr(fn))}")
+
+
+def register_capital_callback(fn: "callable") -> None:
+    """Register a synchronous getter that returns the trader's current live capital.
+
+    Called once at startup (main.py).  Used by _evaluate_market() to compute
+    required_capital dynamically against real-time equity rather than a frozen
+    INITIAL_CAPITAL constant.
+
+    ``fn`` must be a synchronous callable with signature:
+        def fn() -> float   # current live capital in USD
+    """
+    global _get_capital_fn
+    _get_capital_fn = fn
+    print(f"{Fore.CYAN}[SIGNAL] Capital callback registered: {getattr(fn, '__qualname__', repr(fn))}")
 
 
 # ---------------------------------------------------------------------------
@@ -189,11 +201,29 @@ def _evaluate_market(market: dict) -> dict | None:
     if current_price >= price_to_beat:
         correct_side = "UP"
         token_id: str = market["up_token_id"]
-        token_price: float = market["up_price"]
+        _static_token_price: float = market["up_price"]
     else:
         correct_side = "DOWN"
         token_id = market["down_token_id"]
-        token_price = market["down_price"]
+        _static_token_price = market["down_price"]
+
+    # ── Live token price resolution (Fix #3) ─────────────────────────────────
+    # Prefer the live CLOB WebSocket cache over the 30-second Gamma REST snapshot.
+    # For the correct-side token:
+    #   UP   → we need the best ASK (cheapest price we can buy at)
+    #   DOWN → we need the best ASK (same — we always BUY the winner token)
+    token_price: float = _static_token_price  # fallback to Gamma snapshot
+    book = clob_cache.get_orderbook(token_id)
+    if book is not None:
+        asks = book.get("asks", {})
+        if asks:
+            try:
+                live_ask = min(float(p) for p in asks)
+                if 0.0 < live_ask < 1.0:
+                    token_price = live_ask
+            except (ValueError, TypeError):
+                pass  # fall back to static price
+    # ─────────────────────────────────────────────────────────────────────────
 
     # Dynamic risk engine: scales with token price, bounded [0.06%, 0.12%]
     risk_multiplier = 1.0 + (token_price * 0.4)
@@ -208,8 +238,17 @@ def _evaluate_market(market: dict) -> dict | None:
     if not (c1 and c2 and c3):
         return None
 
-    # --- Microsecond liquidity gate: RAM-only order book validation ---
-    required_capital = Config.INITIAL_CAPITAL * Config.MAX_POSITION_SIZE_PCT
+    # ── Dynamic liquidity gate (Fix #4) ──────────────────────────────────────
+    # Use live capital from trader instead of frozen INITIAL_CAPITAL constant.
+    live_capital: float = Config.INITIAL_CAPITAL  # conservative fallback
+    if _get_capital_fn is not None:
+        try:
+            live_capital = float(_get_capital_fn())
+        except Exception:  # pylint: disable=broad-except
+            pass
+    required_capital = max(live_capital, Config.INITIAL_CAPITAL) * Config.MAX_POSITION_SIZE_PCT
+    # ─────────────────────────────────────────────────────────────────────────
+
     is_liquid, available_value = validate_liquidity(
         token_id, "BUY", token_price, required_capital
     )
@@ -453,7 +492,7 @@ async def _check_hedge_triggers(open_positions: dict) -> None:
 # Evaluation loop
 # ---------------------------------------------------------------------------
 
-async def _evaluate_once(markets: dict) -> int:
+async def _evaluate_once(markets: dict, queue: asyncio.Queue) -> int:
     """One evaluation pass. Returns signals generated."""
     # ── Stale Cache Guard ────────────────────────────────────────────────────
     # If the WebSocket is not live, the order book may be a frozen REST snapshot.
@@ -477,11 +516,14 @@ async def _evaluate_once(markets: dict) -> int:
             SIGNALED_MARKETS.add(signal["condition_id"])
             _record_signal(signal)
             _emit_signal(signal)
+            # ── Queue delivery (Fix #1): zero-lag hand-off to trader ──────────
+            await queue.put(signal)
+            # ─────────────────────────────────────────────────────────────────
             generated += 1
     return generated
 
 
-async def run_signal_engine() -> None:
+async def run_signal_engine(queue: asyncio.Queue) -> None:
     """Evaluate all active markets and open-position hedge triggers every second."""
     global _last_diag_ts
 
@@ -516,9 +558,6 @@ async def run_signal_engine() -> None:
                 _last_diag_ts = time.time()
 
             # ── Phase 3: Escape Hatch ─────────────────────────────────────────
-            # Pull live open positions from the active trader and check each one
-            # for a baseline breach.  _get_open_positions_fn is injected by main.py
-            # via register_hedge_callback() — we piggy-back the same registry.
             if _hedge_callback is not None and _get_open_positions_fn is not None:
                 try:
                     open_positions: dict = _get_open_positions_fn()
@@ -528,7 +567,7 @@ async def run_signal_engine() -> None:
                     print(f"{Fore.RED}[SIGNAL] Hedge check error: {exc}")
             # ─────────────────────────────────────────────────────────────────
 
-            generated = await _evaluate_once(markets)
+            generated = await _evaluate_once(markets, queue)
 
         except Exception as exc:
             print(f"{Fore.RED}[SIGNAL] Unexpected error: {exc}")

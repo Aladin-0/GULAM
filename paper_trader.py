@@ -203,6 +203,11 @@ def get_open_positions() -> dict:
     return PAPER_STATE["open_positions"]
 
 
+def get_live_capital() -> float:
+    """Return current paper capital (USD).  Called by signal_engine via callback."""
+    return PAPER_STATE["capital"]
+
+
 def get_performance_summary() -> dict:
     """Return a concise performance snapshot."""
     total_trades = PAPER_STATE["total_trades"]
@@ -614,7 +619,7 @@ _OPEN_POS_PRINT_INTERVAL = 30
 _last_open_pos_ts: float = 0.0
 
 
-async def run_paper_trader() -> None:
+async def run_paper_trader(queue: asyncio.Queue) -> None:
     """Monitor signals and positions continuously. Public coroutine for main.py."""
     global _last_processed_index, _last_summary_ts, _last_open_pos_ts
 
@@ -647,52 +652,60 @@ async def run_paper_trader() -> None:
             exit_price = 1.0 if oracle_price < ptb else 0.0
 
         _close_position(cid, exit_price, "startup_cleanup")
-        print(
-            f"[PAPER] STARTUP CLEANUP: closed stale {pos['symbol']} {pos['side']}"
-        )
+        print(f"[PAPER] STARTUP CLEANUP: closed stale {pos['symbol']} {pos['side']}")
 
-    while True:
-        try:
-            _maybe_daily_reset()
+    # ── Fix #1: Queue-based consumer — replaces 5-second polling loop ─────────
 
-            # --- Process ALL new signals since last cycle ---
-            if not _trading_halted:
-                new_signals = SIGNAL_HISTORY[_last_processed_index:]
-                _last_processed_index = len(SIGNAL_HISTORY)
-                if not _check_daily_loss_limit():
-                    for signal in new_signals:
-                        _open_position(signal)
+    async def _signal_consumer() -> None:
+        """Consume signals from the shared asyncio.Queue as they arrive."""
+        while True:
+            signal = await queue.get()
+            try:
+                _maybe_daily_reset()
+                if not _trading_halted and not _check_daily_loss_limit():
+                    _open_position(signal)
+            except Exception as exc:  # pylint: disable=broad-except
+                print(f"{Fore.RED}[PAPER] Error processing signal: {exc}")
+            finally:
+                queue.task_done()
 
-            # --- Monitor open positions ---
-            if PAPER_STATE["open_positions"]:
-                await _monitor_positions()
+    async def _position_monitor() -> None:
+        """Background task: settle positions and print periodic summaries."""
+        global _last_summary_ts, _last_open_pos_ts
+        while True:
+            try:
+                _maybe_daily_reset()
 
-                # Print open positions status every 30 seconds
-                if time.time() - _last_open_pos_ts >= _OPEN_POS_PRINT_INTERVAL:
-                    parts = []
-                    for pos in PAPER_STATE["open_positions"].values():
-                        lp = pos.get("last_price", pos["entry_price"])
-                        parts.append(
-                            f"[{pos['symbol'].upper()} {pos['side']}] "
-                            f"entry={pos['entry_price']:.3f} last_price={lp:.3f}"
-                        )
-                    print(f"{Fore.CYAN}[PAPER] Open: {' | '.join(parts)}")
-                    _last_open_pos_ts = time.time()
+                if PAPER_STATE["open_positions"]:
+                    await _monitor_positions()
 
-            # --- Daily loss limit check (always, even without new signal) ---
-            _check_daily_loss_limit()
+                    if time.time() - _last_open_pos_ts >= _OPEN_POS_PRINT_INTERVAL:
+                        parts = []
+                        for pos in PAPER_STATE["open_positions"].values():
+                            lp = pos.get("last_price", pos["entry_price"])
+                            parts.append(
+                                f"[{pos['symbol'].upper()} {pos['side']}] "
+                                f"entry={pos['entry_price']:.3f} last_price={lp:.3f}"
+                            )
+                        print(f"{Fore.CYAN}[PAPER] Open: {' | '.join(parts)}")
+                        _last_open_pos_ts = time.time()
 
-            # --- Periodic performance summary every 5 minutes ---
-            if time.time() - _last_summary_ts >= SUMMARY_INTERVAL_SECONDS:
-                _print_performance_summary()
-                _last_summary_ts = time.time()
+                _check_daily_loss_limit()
 
-        except Exception as exc:  # pylint: disable=broad-except
-            print(f"{Fore.RED}[PAPER] Unexpected error: {exc}")
+                if time.time() - _last_summary_ts >= SUMMARY_INTERVAL_SECONDS:
+                    _print_performance_summary()
+                    _last_summary_ts = time.time()
 
-        await asyncio.sleep(MONITOR_INTERVAL_SECONDS)
+            except Exception as exc:  # pylint: disable=broad-except
+                print(f"{Fore.RED}[PAPER] Unexpected error: {exc}")
+            await asyncio.sleep(MONITOR_INTERVAL_SECONDS)
+
+    await asyncio.gather(
+        _signal_consumer(),
+        _position_monitor(),
+    )
 
 
 if __name__ == "__main__":
     Config.summary()
-    asyncio.run(run_paper_trader())
+    asyncio.run(run_paper_trader(asyncio.Queue()))
