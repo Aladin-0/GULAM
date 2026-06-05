@@ -342,12 +342,16 @@ async def _place_order(signal: dict, size_usd: float) -> dict | None:
     # ─────────────────────────────────────────────────────────────────────────
 
     # ── CLOB precision gate ───────────────────────────────────────────────────
-    # Force strict truncation matching exchange rules
+    # Force shares to be a whole integer to bypass SDK float corruption
     raw_shares = size_usd / entry_price
-    shares = math.floor(raw_shares * 10000) / 10000.0
+    shares = float(math.floor(raw_shares))
 
-    # Ensure the implied USD cost doesn't leak floating-point noise
-    size_usd = float(f"{shares * entry_price:.2f}")
+    if shares < 1.0:
+        print(f"{Fore.YELLOW}[LIVE] ⚠️ Skipping trade: Capital (${size_usd:.2f}) too low to buy at least 1 whole share at {entry_price}")
+        return None
+
+    # The resulting size_usd will strictly have a maximum of 2 decimals (e.g., 4.0 * 0.45 = 1.80)
+    size_usd = round(shares * entry_price, 2)
 
     print(
         f"{Fore.CYAN}[LIVE] Order math → price={entry_price}  "
@@ -355,8 +359,8 @@ async def _place_order(signal: dict, size_usd: float) -> dict | None:
     )
     # ─────────────────────────────────────────────────────────────────────────
 
-    if shares <= 0 or entry_price <= 0:
-        print(f"{Fore.RED}[LIVE] Invalid order params: shares={shares} price={entry_price}")
+    if entry_price <= 0:
+        print(f"{Fore.RED}[LIVE] Invalid order params: price={entry_price}")
         return None
 
     order_args = OrderArgs(
