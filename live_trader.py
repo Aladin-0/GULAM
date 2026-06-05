@@ -342,21 +342,12 @@ async def _place_order(signal: dict, size_usd: float) -> dict | None:
     # ─────────────────────────────────────────────────────────────────────────
 
     # ── CLOB precision gate ───────────────────────────────────────────────────
-    # Polymarket requires: maker_amount (USD spent) max 2dp, size (shares) max 4dp.
-    # We must find a share amount that results in exactly a 2-decimal USD cost.
-    def calculate_aligned_shares(usd_capital: float, price: float) -> float:
-        if price <= 0: return 0.0
-        p_int = int(round(price * 10000))
-        step = 1000000 // math.gcd(p_int, 1000000)
-        ideal_shares = usd_capital / price
-        ideal_k = int(ideal_shares * 10000)
-        valid_k = (ideal_k // step) * step
-        if valid_k == 0:
-            valid_k = step
-        return valid_k / 10000.0
+    # Force strict truncation matching exchange rules
+    raw_shares = size_usd / entry_price
+    shares = math.floor(raw_shares * 10000) / 10000.0
 
-    shares: float = calculate_aligned_shares(size_usd, entry_price)
-    size_usd: float = round(shares * entry_price, 2)
+    # Ensure the implied USD cost doesn't leak floating-point noise
+    size_usd = float(f"{shares * entry_price:.2f}")
 
     print(
         f"{Fore.CYAN}[LIVE] Order math → price={entry_price}  "
