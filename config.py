@@ -45,14 +45,17 @@ class _Config:
     MAX_POSITION_AGE_SECONDS: int = int(os.getenv("MAX_POSITION_AGE_SECONDS", "900"))
 
     # --- Signal Filter ---
-    BASE_GAP_BPS: float = float(os.getenv("BASE_GAP_BPS", "6.0"))
+    BASE_GAP_BPS: float = float(os.getenv("BASE_GAP_BPS", "100.0"))
     MAX_TOKEN_PRICE: float = float(os.getenv("MAX_TOKEN_PRICE", "0.85"))
-    MIN_PRICE_MOVE_PCT: float = float(os.getenv("MIN_PRICE_MOVE_PCT", "0.60"))
+    MIN_PRICE_MOVE_PCT: float = float(os.getenv("MIN_PRICE_MOVE_PCT", "0.25"))
     MIN_TIME_REMAINING_MINUTES: int = int(os.getenv("MIN_TIME_REMAINING_MINUTES", "5"))
 
     # --- Dynamic Risk Gate Bounds ---
-    MIN_DYNAMIC_NEED_PCT: float = float(os.getenv("MIN_DYNAMIC_NEED_PCT", "0.0006"))
-    MAX_DYNAMIC_NEED_PCT: float = float(os.getenv("MAX_DYNAMIC_NEED_PCT", "0.0012"))
+    # NOTE: bounds must be >= BASE_GAP_BPS/10000 or the cap will override it.
+    # With BASE_GAP_BPS=100 (1.0%), raw dynamic_need peaks at ~1.4%.
+    # Ceiling raised to 0.02 (2%) so the gap calculation is never capped out.
+    MIN_DYNAMIC_NEED_PCT: float = float(os.getenv("MIN_DYNAMIC_NEED_PCT", "0.0025"))
+    MAX_DYNAMIC_NEED_PCT: float = float(os.getenv("MAX_DYNAMIC_NEED_PCT", "0.0200"))
 
     # --- Risk Management ---
     DAILY_LOSS_LIMIT_PCT: float = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "0.02"))

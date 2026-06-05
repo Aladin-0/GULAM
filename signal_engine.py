@@ -234,8 +234,9 @@ def _evaluate_market(market: dict) -> dict | None:
     c1 = abs(move_pct) > dynamic_need_pct
     c2 = 0 < t_left_s <= Config.MAX_EXECUTION_TIME_SECONDS
     c3 = token_price < Config.MAX_TOKEN_PRICE  # market disagrees with oracle — strong edge
+    c5 = abs(move_pct) >= Config.MIN_PRICE_MOVE_PCT / 100.0  # hard floor: covers gas costs
 
-    if not (c1 and c2 and c3):
+    if not (c1 and c2 and c3 and c5):
         return None
 
     # ── Dynamic liquidity gate (Fix #4) ──────────────────────────────────────
@@ -373,6 +374,7 @@ def _print_diagnostics(markets: dict) -> None:
             c1 = abs(move) > dynamic_need_pct
             c2 = 0 < t_left_s <= Config.MAX_EXECUTION_TIME_SECONDS
             c3 = token_price < Config.MAX_TOKEN_PRICE
+            c5 = abs(move) >= Config.MIN_PRICE_MOVE_PCT / 100.0
 
             # Liquidity check for diagnostics
             required_capital = Config.INITIAL_CAPITAL * Config.MAX_POSITION_SIZE_PCT
@@ -386,12 +388,13 @@ def _print_diagnostics(markets: dict) -> None:
             c2s = f"{Fore.GREEN}C2✓{Fore.WHITE}" if c2 else f"{Fore.RED}C2✗(t={t_left_s:.0f}s not in 0-{Config.MAX_EXECUTION_TIME_SECONDS}s){Fore.WHITE}"
             c3s = f"{Fore.GREEN}C3✓{Fore.WHITE}" if c3 else f"{Fore.RED}C3✗(token={token_price:.3f}>{Config.MAX_TOKEN_PRICE}){Fore.WHITE}"
             c4s = f"{Fore.GREEN}LIQ✓${available_value:.0f}{Fore.WHITE}" if c4 else f"{Fore.RED}LIQ✗${available_value:.0f}<{required_capital:.0f}{Fore.WHITE}"
+            c5s = f"{Fore.GREEN}C5✓{Fore.WHITE}" if c5 else f"{Fore.RED}C5✗(move={move*100:.3f}%<floor={Config.MIN_PRICE_MOVE_PCT:.2f}%){Fore.WHITE}"
 
             slug = mkt.get("slug", cid)[-28:]
             already = " [already signaled]" if cid in SIGNALED_MARKETS else ""
             print(
                 f"{Fore.WHITE}  {slug:<30} {side:>4} {token_price:>6.3f} {t_left_s:>5.0f}s  "
-                f"{c1s} {c2s} {c3s} {c4s}{already}"
+                f"{c1s} {c2s} {c3s} {c5s} {c4s}{already}"
             )
     else:
         print(f"{Fore.YELLOW}  No active markets being tracked.")
