@@ -361,7 +361,7 @@ async def _place_order(signal: dict, size_usd: float) -> dict | None:
                 client.create_and_post_order,
                 order_args,
                 PartialCreateOrderOptions(tick_size="0.01"),
-                OrderType.IOC,   # Immediate-Or-Cancel: auto-cancels if book shifts
+                OrderType.FOK,   # Fill-Or-Kill: fills at exact price or auto-cancels (library equiv of IOC)
             ),
             timeout=10.0,
         )
