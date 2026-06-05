@@ -303,21 +303,24 @@ async def _verify_order_filled(order_id: str, token_id: str, max_wait: float = 3
 
 async def _place_order(signal: dict, size_usd: float) -> dict | None:
     """
-    Construct, sign and POST a GTC limit order to the Polymarket CLOB.
+    Construct, sign and POST an IOC limit order to the Polymarket CLOB.
 
     Returns the API response dict on success, or None on any failure.
     A None return means NO order was sent — capital is safe.
 
-    Fix #2 — Aggressive Taker Execution:
-      Instead of placing at the Gamma REST snapshot price (maker order that
-      waits for a counterparty), we cross the spread by targeting the live
-      best-ask from the CLOB WebSocket cache, then adding a small slippage
-      buffer (+0.005) so our order sits above all resting asks and executes
-      immediately as a taker.  The result is capped at MAX_TOKEN_PRICE.
+    Zero-Slippage Taker strategy:
+      - Price  = exact top-of-book ask (min asks) from the live CLOB WS cache,
+                 rounded to 4 decimal places and capped at MAX_TOKEN_PRICE.
+                 No slippage buffer is added — we pay exactly what the market
+                 is offering, not a cent more.
+      - Type   = IOC (Immediate-Or-Cancel).  If the ask shifts during the
+                 broadcast round-trip, the order auto-cancels instead of
+                 resting in the book as an unintended maker order.
+    Fallback: if the WS cache is empty, use the signal's Gamma REST price.
     """
     token_id: str = signal["token_id"]
 
-    # ── Live taker price (Fix #2) ─────────────────────────────────────────────
+    # ── Zero-slippage taker price ─────────────────────────────────────────────
     _snapshot_price: float = signal["entry_price"]  # Gamma REST fallback
     _taker_price: float = _snapshot_price
     book = clob_cache.get_orderbook(token_id)
@@ -327,7 +330,7 @@ async def _place_order(signal: dict, size_usd: float) -> dict | None:
             try:
                 best_ask = min(float(p) for p in asks)
                 if 0.0 < best_ask < 1.0:
-                    _taker_price = best_ask + 0.005  # cross the spread aggressively
+                    _taker_price = best_ask   # exact top-of-book — no buffer
             except (ValueError, TypeError):
                 pass
     entry_price: float = round(
@@ -358,7 +361,7 @@ async def _place_order(signal: dict, size_usd: float) -> dict | None:
                 client.create_and_post_order,
                 order_args,
                 PartialCreateOrderOptions(tick_size="0.01"),
-                OrderType.GTC,
+                OrderType.IOC,   # Immediate-Or-Cancel: auto-cancels if book shifts
             ),
             timeout=10.0,
         )
