@@ -727,37 +727,77 @@ async def run_live_trader() -> None:
         )
         return
 
-    # ── Pre-flight: internal exchange balance check ───────────────────────────
-    # Funds deposited via the Polymarket website live in the proxy wallet ledger.
-    # If that balance is 0 the CLOB will reject every order — abort early.
+    # ── Pre-flight: balance check (CLOB API + on-chain fallback) ─────────────
+    # The CLOB get_balance_allowance endpoint may return 0 for EIP-1967 deposit
+    # wallets even when funds exist. We therefore also check on-chain directly.
+    import os as _pre_os
+    _deposit_wallet = _pre_os.getenv("POLYMARKET_PROXY_WALLET", "").strip()
+    _PUSD_ADDR = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+    _DECIMALS  = 1_000_000
+    internal_balance_usd: float = 0.0
+
     try:
         from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
         bal_resp = await asyncio.to_thread(
             client.get_balance_allowance,
             BalanceAllowanceParams(asset_type=AssetType.COLLATERAL),
         )
-        raw_balance = float(bal_resp.get("balance", 0) or 0)
-        DECIMALS = 1_000_000  # pUSD / USDC — 6 decimals
-        internal_balance_usd = raw_balance / DECIMALS
+        raw_balance = float((bal_resp or {}).get("balance", 0) or 0)
+        internal_balance_usd = raw_balance / _DECIMALS
         print(
-            f"{Fore.CYAN}[LIVE] Internal exchange balance: "
-            f"${internal_balance_usd:.4f} pUSD"
+            f"{Fore.CYAN}[LIVE] CLOB reported balance  : ${internal_balance_usd:.4f} pUSD"
         )
-        if internal_balance_usd == 0:
-            print(
-                f"\n{Fore.RED}{Style.BRIGHT}"
-                f"[LIVE] ⛔ internal trading account balance is 0. "
-                f"Please execute a deposit flow to clear funds for execution.\n"
-                f"[LIVE] Visit https://polymarket.com and ensure your funds "
-                f"are deposited into the exchange (Cash balance > 0).\n"
-                f"[LIVE] Halting bot — no orders will be placed."
-            )
-            return
     except Exception as exc:  # pylint: disable=broad-except
         print(
-            f"{Fore.YELLOW}[LIVE] Could not verify internal balance: "
-            f"{type(exc).__name__}: {exc}  — proceeding with caution."
+            f"{Fore.YELLOW}[LIVE] CLOB balance API error: {type(exc).__name__} — "
+            f"falling back to on-chain check."
         )
+
+    # On-chain fallback: query pUSD balance at the deposit wallet directly
+    if internal_balance_usd == 0 and _deposit_wallet:
+        try:
+            from web3 import Web3 as _W3
+            _w3 = _W3(_W3.HTTPProvider("https://polygon-bor-rpc.publicnode.com",
+                                        request_kwargs={"timeout": 10}))
+            _erc20_abi = [{"inputs":[{"name":"a","type":"address"}],"name":"balanceOf",
+                           "outputs":[{"type":"uint256"}],"stateMutability":"view",
+                           "type":"function"}]
+            _pusd = _w3.eth.contract(
+                address=_W3.to_checksum_address(_PUSD_ADDR), abi=_erc20_abi)
+            _raw = _pusd.functions.balanceOf(
+                _W3.to_checksum_address(_deposit_wallet)).call()
+            internal_balance_usd = _raw / _DECIMALS
+            print(
+                f"{Fore.CYAN}[LIVE] On-chain deposit wallet : ${internal_balance_usd:.4f} pUSD  "
+                f"({_deposit_wallet[:16]}...)"
+            )
+        except Exception as exc2:  # pylint: disable=broad-except
+            print(
+                f"{Fore.YELLOW}[LIVE] On-chain balance check failed: "
+                f"{type(exc2).__name__} — proceeding with caution."
+            )
+
+    if internal_balance_usd == 0:
+        print(
+            f"\n{Fore.RED}{Style.BRIGHT}"
+            f"[LIVE] ⛔ Deposit wallet has 0 pUSD — no funds to trade.\n"
+            f"[LIVE] Go to https://polymarket.com → Deposit to fund your account.\n"
+            f"[LIVE] Deposit wallet: {_deposit_wallet}\n"
+            f"[LIVE] Halting bot — no orders will be placed."
+        )
+        return
+
+    # Sync LIVE_STATE capital with actual on-chain balance
+    if internal_balance_usd > 0 and internal_balance_usd != LIVE_STATE["capital"]:
+        print(
+            f"{Fore.CYAN}[LIVE] Syncing capital to on-chain balance: "
+            f"${LIVE_STATE['capital']:.2f} → ${internal_balance_usd:.2f}"
+        )
+        LIVE_STATE["capital"]           = internal_balance_usd
+        LIVE_STATE["available_capital"] = internal_balance_usd - sum(
+            p["cost"] for p in LIVE_STATE["open_positions"].values()
+        )
+        _live_persist_state()
     # ─────────────────────────────────────────────────────────────────────────
 
     last_summary_ts = time.time()
