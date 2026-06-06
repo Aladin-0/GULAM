@@ -223,7 +223,7 @@ def _evaluate_market(market: dict) -> dict | None:
                 pass  # fall back to static price
     # ─────────────────────────────────────────────────────────────────────────
 
-    c1 = abs(move_pct) >= 0.0012     # A strong 0.12% wick
+    c1 = abs(move_pct) >= 0.0009     # A strong 0.09% wick
     c2 = t_left_s >= 300             # At least 5 minutes left
     c3 = token_price <= 0.35         # Token dropped to 35 cents or lower
     
@@ -368,7 +368,7 @@ def _print_diagnostics(markets: dict) -> None:
                 side = "UP"
                 token_price = mkt.get("up_price", 0.0)
 
-            c1 = abs(move) >= 0.0012
+            c1 = abs(move) >= 0.0009
             c2 = t_left_s >= 300
             c3 = token_price <= 0.35
             
