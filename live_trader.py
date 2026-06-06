@@ -336,12 +336,10 @@ async def _place_order(signal: dict, size_usd: float) -> dict | None:
             try:
                 best_ask = min(float(p) for p in asks)
                 if 0.0 < best_ask < 1.0:
-                    # NOTE: We ALWAYS place a Side.BUY order for the specific token (UP or DOWN).
-                    # Therefore, we ALWAYS buy from the `asks` book. 
-                    # Deep Sweep: Market makers pull liquidity in the final 60s. We sweep the
-                    # entire orderbook up to $0.96. Since the oracle guarantees a win,
-                    # ANY fill under $0.96 is pure profit. We don't care about the best ask anymore.
-                    _taker_price = 0.96
+                    # The Fade Strategy relies on ONLY buying tokens at the cheap
+                    # target price. We CANNOT sweep up to $0.96 anymore, or we will
+                    # overpay and ruin the risk/reward ratio.
+                    _taker_price = best_ask
             except (ValueError, TypeError):
                 pass
     entry_price: float = round(
