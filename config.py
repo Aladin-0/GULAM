@@ -37,7 +37,7 @@ class _Config:
 
     # --- Capital & Position Sizing ---
     INITIAL_CAPITAL: float = float(os.getenv("INITIAL_CAPITAL", "10.0"))
-    MAX_POSITION_SIZE_PCT: float = float(os.getenv("MAX_POSITION_SIZE_PCT", "0.55"))
+    MAX_POSITION_SIZE_PCT: float = float(os.getenv("MAX_POSITION_SIZE_PCT", "0.20"))
     MIN_ORDER_SIZE_USD: float = float(os.getenv("MIN_ORDER_SIZE_USD", "1.0"))
 
     # --- Execution Timing ---
