@@ -41,6 +41,12 @@ _BINANCE_WS_URLS: dict[str, str] = {
     "sol/usd": "wss://stream.binance.com:9443/ws/solusdt@aggTrade",
 }
 
+_BINANCE_DEPTH_URLS: dict[str, str] = {
+    "btc/usd": "wss://stream.binance.com:9443/ws/btcusdt@depth10@100ms",
+    "eth/usd": "wss://stream.binance.com:9443/ws/ethusdt@depth10@100ms",
+    "sol/usd": "wss://stream.binance.com:9443/ws/solusdt@depth10@100ms",
+}
+
 # REST symbol mapping  (oracle key → Binance USDT pair)
 _BINANCE_REST_SYMBOLS: dict[str, str] = {
     "btc/usd": "BTCUSDT",
@@ -49,9 +55,9 @@ _BINANCE_REST_SYMBOLS: dict[str, str] = {
 }
 
 LATEST_PRICES: dict[str, dict] = {
-    "btc/usd": {"price": 0.0, "timestamp": 0, "open_price": 0.0},
-    "eth/usd": {"price": 0.0, "timestamp": 0, "open_price": 0.0},
-    "sol/usd": {"price": 0.0, "timestamp": 0, "open_price": 0.0},
+    "btc/usd": {"price": 0.0, "timestamp": 0, "open_price": 0.0, "imbalance": 0.5},
+    "eth/usd": {"price": 0.0, "timestamp": 0, "open_price": 0.0, "imbalance": 0.5},
+    "sol/usd": {"price": 0.0, "timestamp": 0, "open_price": 0.0, "imbalance": 0.5},
 }
 
 _TRACKED = set(LATEST_PRICES.keys())
@@ -319,6 +325,42 @@ async def _listen_symbol(symbol: str) -> None:
             ping_task.cancel()
 
 
+async def _listen_depth(symbol: str) -> None:
+    """Connect and stream orderbook depth for one symbol to calculate imbalance."""
+    url = _BINANCE_DEPTH_URLS[symbol]
+    async with websockets.connect(
+        url, ping_interval=None, ping_timeout=None
+    ) as ws:
+        ping_task = asyncio.create_task(_ping_loop(ws))
+        try:
+            while True:
+                message = await asyncio.wait_for(ws.recv(), timeout=STALE_THRESHOLD_SECONDS)
+                try:
+                    data = json.loads(message)
+                except json.JSONDecodeError:
+                    continue
+                
+                bids = data.get("bids", [])
+                asks = data.get("asks", [])
+                
+                if bids and asks:
+                    try:
+                        # Sum the volume (qty) of the top 10 bids and asks
+                        # format is [["price", "qty"], ["price", "qty"]]
+                        bid_vol = sum(float(b[1]) for b in bids)
+                        ask_vol = sum(float(a[1]) for a in asks)
+                        total_vol = bid_vol + ask_vol
+                        
+                        if total_vol > 0:
+                            # 1.0 = All Bids (Buy Wall), 0.0 = All Asks (Sell Wall)
+                            imbalance = bid_vol / total_vol
+                            LATEST_PRICES[symbol]["imbalance"] = imbalance
+                    except (ValueError, TypeError, IndexError):
+                        pass
+        finally:
+            ping_task.cancel()
+
+
 async def _run_symbol(symbol: str) -> None:
     """Seed period open_price from REST, then run WebSocket with auto-reconnect."""
     label = symbol.split("/")[0].upper()
@@ -343,7 +385,26 @@ async def _run_symbol(symbol: str) -> None:
     # ── Step 2: WebSocket stream with auto-reconnect ──────────────────────────
     while True:
         try:
-            await _listen_symbol(symbol)
+            # Run both the aggTrade listener and the depth listener concurrently
+            listen_task = asyncio.create_task(_listen_symbol(symbol))
+            depth_task = asyncio.create_task(_listen_depth(symbol))
+            
+            # Wait for either to fail/exit
+            done, pending = await asyncio.wait(
+                [listen_task, depth_task], 
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            
+            # Cancel the one that didn't fail
+            for task in pending:
+                task.cancel()
+                
+            # If one raised an exception, re-raise it so the catch block handles it
+            for task in done:
+                exc = task.exception()
+                if exc:
+                    raise exc
+
         except asyncio.TimeoutError:
             print(
                 f"{Fore.YELLOW}[ORACLE] [{label}] No message in "

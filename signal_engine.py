@@ -226,8 +226,19 @@ def _evaluate_market(market: dict) -> dict | None:
     c1 = abs(move_pct) >= 0.0012     # A strong 0.12% wick
     c2 = t_left_s >= 300             # At least 5 minutes left
     c3 = token_price <= 0.35         # Token dropped to 35 cents or lower
+    
+    # ── Orderbook Wall Verification ──────────────────────────────────────────
+    # Check the Binance orderbook to verify the whale stopped buying/selling.
+    # imbalance = bids / (bids + asks).
+    imbalance: float = entry.get("imbalance", 0.5)
+    if correct_side == "DOWN":
+        # Oracle spiked UP. We need a SELL WALL to push it back down.
+        c4 = imbalance < 0.35
+    else:
+        # Oracle crashed DOWN. We need a BUY WALL to push it back up.
+        c4 = imbalance > 0.65
 
-    if not (c1 and c2 and c3):
+    if not (c1 and c2 and c3 and c4):
         return None
 
     # ── Dynamic liquidity gate (Fix #4) ──────────────────────────────────────
@@ -360,6 +371,12 @@ def _print_diagnostics(markets: dict) -> None:
             c1 = abs(move) >= 0.0012
             c2 = t_left_s >= 300
             c3 = token_price <= 0.35
+            
+            imbalance = LATEST_PRICES.get(_oracle_key(sym), {}).get("imbalance", 0.5)
+            if side == "DOWN":
+                c4 = imbalance < 0.35
+            else:
+                c4 = imbalance > 0.65
 
             # Liquidity check for diagnostics
             required_capital = Config.INITIAL_CAPITAL * Config.MAX_POSITION_SIZE_PCT
@@ -367,18 +384,17 @@ def _print_diagnostics(markets: dict) -> None:
                 mkt.get("up_token_id" if side == "UP" else "down_token_id", ""),
                 "BUY", token_price, required_capital
             )
-            c4 = is_liquid
-
-            c1s = f"{Fore.GREEN}C1✓{Fore.WHITE}" if c1 else f"{Fore.RED}C1✗(move={move*100:.3f}%<wick=0.120%){Fore.WHITE}"
-            c2s = f"{Fore.GREEN}C2✓{Fore.WHITE}" if c2 else f"{Fore.RED}C2✗(t={t_left_s:.0f}s < 300s){Fore.WHITE}"
-            c3s = f"{Fore.GREEN}C3✓{Fore.WHITE}" if c3 else f"{Fore.RED}C3✗(token={token_price:.3f}>$0.35){Fore.WHITE}"
-            c4s = f"{Fore.GREEN}LIQ✓${available_value:.0f}{Fore.WHITE}" if c4 else f"{Fore.RED}LIQ✗${available_value:.0f}<{required_capital:.0f}{Fore.WHITE}"
-
             slug = mkt.get("slug", cid)[-28:]
             already = " [already signaled]" if cid in SIGNALED_MARKETS else ""
+
+            c1s = f"{Fore.GREEN}C1✓{Fore.WHITE}" if c1 else f"{Fore.RED}C1✗(wick={move*100:.3f}%){Fore.WHITE}"
+            c2s = f"{Fore.GREEN}C2✓{Fore.WHITE}" if c2 else f"{Fore.RED}C2✗(t={t_left_s:.0f}s){Fore.WHITE}"
+            c3s = f"{Fore.GREEN}C3✓{Fore.WHITE}" if c3 else f"{Fore.RED}C3✗(price={token_price:.3f}){Fore.WHITE}"
+            c4s = f"{Fore.GREEN}C4✓{Fore.WHITE}" if c4 else f"{Fore.RED}C4✗(wall={imbalance:.2f}){Fore.WHITE}"
+            c5s = f"{Fore.GREEN}LIQ✓${available_value:.0f}{Fore.WHITE}" if is_liquid else f"{Fore.RED}LIQ✗${available_value:.0f}<{required_capital:.0f}{Fore.WHITE}"
             print(
                 f"{Fore.WHITE}  {slug:<30} {side:>4} {token_price:>6.3f} {t_left_s:>5.0f}s  "
-                f"{c1s} {c2s} {c3s} {c4s}{already}"
+                f"{c1s} {c2s} {c3s} {c4s} {c5s}{already}"
             )
     else:
         print(f"{Fore.YELLOW}  No active markets being tracked.")
