@@ -11,6 +11,7 @@ Network resilience layer:
 import asyncio
 import json
 import time
+import random
 from collections import defaultdict
 
 import aiohttp
@@ -32,7 +33,7 @@ SNAPSHOT_TIMEOUT_SECONDS = 10
 # ---------------------------------------------------------------------------
 HEARTBEAT_INTERVAL_SECONDS: int = 15       # ping cadence
 HEARTBEAT_PONG_TIMEOUT_SECONDS: int = 10   # max wait for pong before recycle
-BACKOFF_BASE_SECONDS: float = 1.0          # first retry delay
+BACKOFF_BASE_SECONDS: float = 2.0          # first retry delay
 BACKOFF_MAX_SECONDS: float = 60.0          # ceiling for exponential backoff
 
 # ---------------------------------------------------------------------------
@@ -357,7 +358,7 @@ async def _ws_worker() -> None:
     """
     global _SUBSCRIBED_TOKENS, _WS_CONNECTED
 
-    reconnect_delay: float = BACKOFF_BASE_SECONDS
+    attempt: int = 0
 
     while True:
         # ── Step 1: Wait for scanner to publish at least one token ───────────
@@ -433,7 +434,7 @@ async def _ws_worker() -> None:
 
                 # ── Step 5: Mark WS live — signal engine unblocked ────────────
                 _WS_CONNECTED = True
-                reconnect_delay = BACKOFF_BASE_SECONDS  # reset backoff on success
+                attempt = 0  # reset backoff on success
 
                 # Run all three concurrent tasks under this connection.
                 # Any one raising cancels the rest → falls through to reconnect.
@@ -495,11 +496,12 @@ async def _ws_worker() -> None:
             )
 
         # ── Exponential backoff: 1 → 2 → 4 → 8 → 60s (cap) ─────────────────
+        reconnect_delay = min(BACKOFF_MAX_SECONDS, BACKOFF_BASE_SECONDS * (2 ** attempt)) + random.uniform(0, 1)
         print(
-            f"{Fore.YELLOW}[ORDERBOOK] ⏳ Waiting {reconnect_delay:.0f}s before reconnect..."
+            f"{Fore.YELLOW}[ORDERBOOK] ⏳ Waiting {reconnect_delay:.2f}s before reconnect (attempt {attempt})..."
         )
         await asyncio.sleep(reconnect_delay)
-        reconnect_delay = min(reconnect_delay * 2, BACKOFF_MAX_SECONDS)
+        attempt += 1
 
 
 async def run_orderbook_cache() -> None:

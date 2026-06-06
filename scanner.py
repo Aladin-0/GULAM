@@ -4,6 +4,7 @@
 import asyncio
 import json
 import time
+import random
 from datetime import datetime, timezone
 
 import aiohttp
@@ -233,6 +234,9 @@ async def _refresh_once(session: aiohttp.ClientSession) -> None:
     for asset, slug in slugs:
         raw = await _fetch_slug(session, slug)  # retries + backoff handled inside
         if raw is None:
+            wait_time = random.uniform(5, 10)
+            print(f"{Fore.YELLOW}[SCANNER] Backing off {wait_time:.1f}s due to failure on {slug}...")
+            await asyncio.sleep(wait_time)
             continue
 
         parsed = _parse_market(raw, asset, slug)
@@ -244,6 +248,9 @@ async def _refresh_once(session: aiohttp.ClientSession) -> None:
                 f"→ {parsed['time_remaining_minutes']:.1f} min "
                 f"({parsed['time_remaining_seconds']:.0f}s) remaining  ACCEPTED"
             )
+
+        # Baseline interval of 3 to 5 seconds between successful scan requests
+        await asyncio.sleep(random.uniform(3, 5))
 
     ACTIVE_MARKETS = updated
 
