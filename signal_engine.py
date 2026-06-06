@@ -191,21 +191,19 @@ def _evaluate_market(market: dict) -> dict | None:
     if current_price == 0.0 or price_to_beat == 0.0:
         return None
 
-    # Only trade in the final MAX_EXECUTION_TIME_SECONDS window
-    if not (0 < t_left_s <= Config.MAX_EXECUTION_TIME_SECONDS):
-        return None
-
+    # (Time constraint handled by c2 condition below)
     move_pct: float = (current_price - price_to_beat) / price_to_beat
 
-    # Mispricing edge: oracle says one direction but token price is still cheap
+    # ── FADE THE PREMIUM STRATEGY ──────────────────────────────────────────
+    # We want to buy the LOSING side when a massive wick happens.
     if current_price >= price_to_beat:
-        correct_side = "UP"
-        token_id: str = market["up_token_id"]
-        _static_token_price: float = market["up_price"]
-    else:
         correct_side = "DOWN"
-        token_id = market["down_token_id"]
-        _static_token_price = market["down_price"]
+        token_id: str = market["down_token_id"]
+        _static_token_price: float = market["down_price"]
+    else:
+        correct_side = "UP"
+        token_id = market["up_token_id"]
+        _static_token_price = market["up_price"]
 
     # ── Live token price resolution (Fix #3) ─────────────────────────────────
     # Prefer the live CLOB WebSocket cache over the 30-second Gamma REST snapshot.
@@ -225,15 +223,9 @@ def _evaluate_market(market: dict) -> dict | None:
                 pass  # fall back to static price
     # ─────────────────────────────────────────────────────────────────────────
 
-    # Dynamic risk engine: scales with token price, bounded [0.06%, 0.12%]
-    risk_multiplier = 1.0 + (token_price * 0.4)
-    base = Config.BASE_GAP_BPS / 10000.0
-    dynamic_need_pct: float = base * risk_multiplier
-    dynamic_need_pct = max(Config.MIN_DYNAMIC_NEED_PCT, min(dynamic_need_pct, Config.MAX_DYNAMIC_NEED_PCT))
-
-    c1 = abs(move_pct) > dynamic_need_pct
-    c2 = 0 < t_left_s <= Config.MAX_EXECUTION_TIME_SECONDS
-    c3 = token_price < Config.MAX_TOKEN_PRICE  # market disagrees with oracle — strong edge
+    c1 = abs(move_pct) >= 0.0015     # Must be a sudden 0.15% wick
+    c2 = t_left_s >= 300             # Must have at least 5 minutes left
+    c3 = token_price <= 0.08         # Must be dirt cheap (8 cents or less)
 
     if not (c1 and c2 and c3):
         return None
@@ -359,20 +351,15 @@ def _print_diagnostics(markets: dict) -> None:
 
             move = (current - open_p) / open_p
             if current >= open_p:
-                side = "UP"
-                token_price = mkt.get("up_price", 0.0)
-            else:
                 side = "DOWN"
                 token_price = mkt.get("down_price", 0.0)
+            else:
+                side = "UP"
+                token_price = mkt.get("up_price", 0.0)
 
-            risk_multiplier = 1.0 + (token_price * 0.4)
-            base = Config.BASE_GAP_BPS / 10000.0
-            dynamic_need_pct: float = base * risk_multiplier
-            dynamic_need_pct = max(Config.MIN_DYNAMIC_NEED_PCT, min(dynamic_need_pct, Config.MAX_DYNAMIC_NEED_PCT))
-
-            c1 = abs(move) > dynamic_need_pct
-            c2 = 0 < t_left_s <= Config.MAX_EXECUTION_TIME_SECONDS
-            c3 = token_price < Config.MAX_TOKEN_PRICE
+            c1 = abs(move) >= 0.0015
+            c2 = t_left_s >= 300
+            c3 = token_price <= 0.08
 
             # Liquidity check for diagnostics
             required_capital = Config.INITIAL_CAPITAL * Config.MAX_POSITION_SIZE_PCT
@@ -382,9 +369,9 @@ def _print_diagnostics(markets: dict) -> None:
             )
             c4 = is_liquid
 
-            c1s = f"{Fore.GREEN}C1✓{Fore.WHITE}" if c1 else f"{Fore.RED}C1✗(move={move*100:.3f}%<need={dynamic_need_pct*100:.4f}% r={risk_multiplier:.1f}x){Fore.WHITE}"
-            c2s = f"{Fore.GREEN}C2✓{Fore.WHITE}" if c2 else f"{Fore.RED}C2✗(t={t_left_s:.0f}s not in 0-{Config.MAX_EXECUTION_TIME_SECONDS}s){Fore.WHITE}"
-            c3s = f"{Fore.GREEN}C3✓{Fore.WHITE}" if c3 else f"{Fore.RED}C3✗(token={token_price:.3f}>{Config.MAX_TOKEN_PRICE}){Fore.WHITE}"
+            c1s = f"{Fore.GREEN}C1✓{Fore.WHITE}" if c1 else f"{Fore.RED}C1✗(move={move*100:.3f}%<wick=0.150%){Fore.WHITE}"
+            c2s = f"{Fore.GREEN}C2✓{Fore.WHITE}" if c2 else f"{Fore.RED}C2✗(t={t_left_s:.0f}s < 300s){Fore.WHITE}"
+            c3s = f"{Fore.GREEN}C3✓{Fore.WHITE}" if c3 else f"{Fore.RED}C3✗(token={token_price:.3f}>$0.08){Fore.WHITE}"
             c4s = f"{Fore.GREEN}LIQ✓${available_value:.0f}{Fore.WHITE}" if c4 else f"{Fore.RED}LIQ✗${available_value:.0f}<{required_capital:.0f}{Fore.WHITE}"
 
             slug = mkt.get("slug", cid)[-28:]
@@ -406,17 +393,12 @@ def _print_diagnostics(markets: dict) -> None:
 async def _check_hedge_triggers(open_positions: dict, trigger_symbol: str = "") -> None:
     """Scan all open positions for a baseline breach and fire the escape hatch.
 
-    A "baseline breach" means the Binance spot oracle has crossed the epoch
-    open_price in the direction that invalidates the original trade thesis:
-      • UP position  → current spot < open_price  (market is now going DOWN)
-      • DOWN position → current spot > open_price  (market is now going UP)
-
-    The check is only active while the position is still within HEDGE_WINDOW_SECONDS
-    of its entry window (time_remaining was recorded at open).  Expired contracts
-    should already be settling via the monitor loop — we don't touch those.
-
-    This function never raises; all errors are caught and logged.
+    [DISABLED FOR FADE STRATEGY]
+    The Fade strategy buys the losing side specifically expecting a reversion.
+    The escape hatch logic contradicts this thesis.
     """
+    return
+
     global _HEDGED_POSITIONS
 
     if _hedge_callback is None:
