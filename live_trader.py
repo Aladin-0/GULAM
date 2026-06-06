@@ -402,6 +402,15 @@ async def _place_order(signal: dict, size_usd: float) -> dict | None:
         return None
 
     except Exception as exc:  # pylint: disable=broad-except
+        exc_str = str(exc).lower()
+        # Handle Polymarket API specific thin-market rejections gracefully
+        if type(exc).__name__ == "PolyApiException" and (
+            "no orders found" in exc_str or 
+            "partially filled or killed" in exc_str
+        ):
+            print(f"{Fore.YELLOW}[LIVE] ⚠️ Liquidity temporarily exhausted, skipping trade. ({exc})")
+            return None
+            
         # Expose full exception string to allow diagnosis of CLOB rejection reasons
         print(f"{Fore.RED}[LIVE] Order placement failed: {type(exc).__name__}: {exc}")
         return None

@@ -22,7 +22,7 @@ REFRESH_INTERVAL_SECONDS = 30
 RETRY_WAIT_SECONDS = 10
 MAX_TIME_REMAINING_MINUTES = 30  # accept current + next upcoming market
 SLUG_FETCH_RETRIES = 3          # max per-slug retry attempts
-SLUG_FETCH_BASE_DELAY = 1.0     # seconds — doubles on each retry (1s, 2s, 4s)
+SLUG_FETCH_BASE_DELAY = 5.0     # seconds — doubles on each retry (5s, 10s, 20s)
 
 ACTIVE_MARKETS: dict[str, dict] = {}
 

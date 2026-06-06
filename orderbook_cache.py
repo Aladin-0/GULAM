@@ -127,7 +127,11 @@ async def _fetch_snapshot(session: aiohttp.ClientSession, token_id: str) -> dict
     """Fetch initial depth snapshot via REST."""
     url = f"{CLOB_REST_URL}/book"
     try:
-        async with session.get(url, params={"token_id": token_id}) as resp:
+        async with session.get(
+            url, 
+            params={"token_id": token_id},
+            timeout=aiohttp.ClientTimeout(total=10.0)
+        ) as resp:
             resp.raise_for_status()
             data = await resp.json()
             return data
