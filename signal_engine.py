@@ -223,9 +223,9 @@ def _evaluate_market(market: dict) -> dict | None:
                 pass  # fall back to static price
     # ─────────────────────────────────────────────────────────────────────────
 
-    c1 = abs(move_pct) >= 0.0015     # Must be a sudden 0.15% wick
-    c2 = t_left_s >= 300             # Must have at least 5 minutes left
-    c3 = token_price <= 0.08         # Must be dirt cheap (8 cents or less)
+    c1 = abs(move_pct) >= 0.0012     # A strong 0.12% wick
+    c2 = t_left_s >= 300             # At least 5 minutes left
+    c3 = token_price <= 0.35         # Token dropped to 35 cents or lower
 
     if not (c1 and c2 and c3):
         return None
@@ -357,9 +357,9 @@ def _print_diagnostics(markets: dict) -> None:
                 side = "UP"
                 token_price = mkt.get("up_price", 0.0)
 
-            c1 = abs(move) >= 0.0015
+            c1 = abs(move) >= 0.0012
             c2 = t_left_s >= 300
-            c3 = token_price <= 0.08
+            c3 = token_price <= 0.35
 
             # Liquidity check for diagnostics
             required_capital = Config.INITIAL_CAPITAL * Config.MAX_POSITION_SIZE_PCT
@@ -369,9 +369,9 @@ def _print_diagnostics(markets: dict) -> None:
             )
             c4 = is_liquid
 
-            c1s = f"{Fore.GREEN}C1✓{Fore.WHITE}" if c1 else f"{Fore.RED}C1✗(move={move*100:.3f}%<wick=0.150%){Fore.WHITE}"
+            c1s = f"{Fore.GREEN}C1✓{Fore.WHITE}" if c1 else f"{Fore.RED}C1✗(move={move*100:.3f}%<wick=0.120%){Fore.WHITE}"
             c2s = f"{Fore.GREEN}C2✓{Fore.WHITE}" if c2 else f"{Fore.RED}C2✗(t={t_left_s:.0f}s < 300s){Fore.WHITE}"
-            c3s = f"{Fore.GREEN}C3✓{Fore.WHITE}" if c3 else f"{Fore.RED}C3✗(token={token_price:.3f}>$0.08){Fore.WHITE}"
+            c3s = f"{Fore.GREEN}C3✓{Fore.WHITE}" if c3 else f"{Fore.RED}C3✗(token={token_price:.3f}>$0.35){Fore.WHITE}"
             c4s = f"{Fore.GREEN}LIQ✓${available_value:.0f}{Fore.WHITE}" if c4 else f"{Fore.RED}LIQ✗${available_value:.0f}<{required_capital:.0f}{Fore.WHITE}"
 
             slug = mkt.get("slug", cid)[-28:]
