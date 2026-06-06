@@ -322,7 +322,7 @@ async def _place_order(signal: dict, size_usd: float) -> dict | None:
     """
     token_id: str = signal["token_id"]
 
-    # ── Zero-slippage taker price ─────────────────────────────────────────────
+    # ── Aggressive taker price ─────────────────────────────────────────────
     _snapshot_price: float = signal["entry_price"]  # Gamma REST fallback
     _taker_price: float = _snapshot_price
     book = clob_cache.get_orderbook(token_id)
@@ -332,7 +332,10 @@ async def _place_order(signal: dict, size_usd: float) -> dict | None:
             try:
                 best_ask = min(float(p) for p in asks)
                 if 0.0 < best_ask < 1.0:
-                    _taker_price = best_ask   # exact top-of-book — no buffer
+                    # NOTE: We ALWAYS place a Side.BUY order for the specific token (UP or DOWN).
+                    # Therefore, we ALWAYS buy from the `asks` book. 
+                    # Add a 1-tick (0.01) slippage buffer to cross the spread and guarantee our FAK order fills.
+                    _taker_price = best_ask + 0.01
             except (ValueError, TypeError):
                 pass
     entry_price: float = round(
