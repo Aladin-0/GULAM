@@ -242,6 +242,7 @@ async def _refresh_once(session: aiohttp.ClientSession) -> None:
         parsed = _parse_market(raw, asset, slug)
 
         if parsed:
+            ACTIVE_MARKETS[parsed["condition_id"]] = parsed
             updated[parsed["condition_id"]] = parsed
             print(
                 f"{Fore.GREEN}[SCANNER] {slug} "
@@ -252,7 +253,10 @@ async def _refresh_once(session: aiohttp.ClientSession) -> None:
         # Baseline interval of 3 to 5 seconds between successful scan requests
         await asyncio.sleep(random.uniform(3, 5))
 
-    ACTIVE_MARKETS = updated
+    # Remove any markets that are no longer active in this pass
+    for cid in list(ACTIVE_MARKETS.keys()):
+        if cid not in updated:
+            ACTIVE_MARKETS.pop(cid, None)
 
     if ACTIVE_MARKETS:
         print(

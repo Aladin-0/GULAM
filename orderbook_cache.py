@@ -389,10 +389,13 @@ async def _ws_worker() -> None:
         # populated before the first signal evaluation can ever run.
         await _seed_snapshots(target_tokens)
 
+        # ── Exponential backoff calculation ─────────────────
+        reconnect_delay = min(BACKOFF_MAX_SECONDS, BACKOFF_BASE_SECONDS * (2 ** attempt)) + random.uniform(0, 1)
+
         try:
             print(
                 f"{Fore.GREEN}[ORDERBOOK] Connecting to Polymarket CLOB WS "
-                f"(next backoff if fail: {reconnect_delay:.0f}s)..."
+                f"(next backoff if fail: {reconnect_delay:.2f}s)..."
             )
             # Disable the built-in ping_interval so our explicit heartbeat loop
             # is the sole keep-alive mechanism — prevents double-ping conflicts.

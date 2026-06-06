@@ -64,6 +64,15 @@ _PERIOD_START: dict[str, int] = {sym: 0 for sym in _TRACKED}
 _last_printed_move: dict[str, float] = {sym: 0.0 for sym in _TRACKED}
 _PRINT_MOVE_THRESHOLD = 0.00005  # 0.005%
 
+# Event-driven callback registry
+_tick_callbacks: list["callable"] = []
+
+def register_tick_callback(cb: "callable") -> None:
+    """Register an async callback to be fired immediately on every price tick.
+    Signature: async def cb(symbol: str) -> None
+    """
+    _tick_callbacks.append(cb)
+
 # ---------------------------------------------------------------------------
 # Public helpers
 # ---------------------------------------------------------------------------
@@ -258,6 +267,13 @@ def _parse_message(symbol: str, raw: str) -> bool:
         return False
 
     _update_price(symbol, latest_price, event_time_ms)
+    
+    # Trigger event-driven evaluation immediately
+    if _tick_callbacks:
+        loop = asyncio.get_running_loop()
+        for cb in _tick_callbacks:
+            loop.create_task(cb(symbol))
+            
     return True
 
 

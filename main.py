@@ -10,11 +10,12 @@ from colorama import Fore, Style, init
 
 from config import Config
 from orderbook_cache import run_orderbook_cache
-from oracle import run_oracle
+from oracle import run_oracle, register_tick_callback
 from scanner import get_market_count, run_scanner
 from signal_engine import (
     get_signal_stats,
     run_signal_engine,
+    on_oracle_tick,
     register_hedge_callback,
     register_positions_callback,
     register_capital_callback,
@@ -63,6 +64,9 @@ register_hedge_callback(_trader_hedge_dump)
 register_positions_callback(_trader_get_positions)
 register_capital_callback(_trader_get_capital)
 
+# Register event-driven signal engine with oracle
+register_tick_callback(on_oracle_tick)
+
 
 
 # ---------------------------------------------------------------------------
@@ -103,9 +107,21 @@ def _print_live_stats() -> None:
         f"({perf['total_trades']} total trades)\n"
         f"{Fore.CYAN}  Losing trades     : {perf['loss_count']}\n"
         f"{Fore.CYAN}  Total lost        : -${perf['total_lost_usd']:.2f}\n"
-        f"{Fore.CYAN}  Open positions    : {perf['open_positions']}\n"
-        f"{Fore.CYAN}{'═' * 54}\n"
+        f"{Fore.CYAN}  Open positions    : {perf['open_positions']}"
     )
+
+    if perf.get("coin_stats"):
+        print(f"{Fore.CYAN}{'─' * 54}")
+        for coin, c_stat in perf["coin_stats"].items():
+            c_sign = "+" if c_stat["profit"] >= 0 else ""
+            c_wr = (c_stat["wins"] / c_stat["trades"] * 100) if c_stat["trades"] > 0 else 0
+            print(
+                f"{Fore.CYAN}  [{coin}]  Trades: {c_stat['trades']:<2} | "
+                f"Win: {c_wr:5.1f}% | "
+                f"P&L: {c_sign}${c_stat['profit']:.4f}"
+            )
+
+    print(f"{Fore.CYAN}{'═' * 54}\n")
 
 
 # ---------------------------------------------------------------------------

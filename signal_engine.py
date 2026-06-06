@@ -406,7 +406,7 @@ def _print_diagnostics(markets: dict) -> None:
 # Phase 3: Escape Hatch — hedge trigger evaluation
 # ---------------------------------------------------------------------------
 
-async def _check_hedge_triggers(open_positions: dict) -> None:
+async def _check_hedge_triggers(open_positions: dict, trigger_symbol: str = "") -> None:
     """Scan all open positions for a baseline breach and fire the escape hatch.
 
     A "baseline breach" means the Binance spot oracle has crossed the epoch
@@ -431,12 +431,20 @@ async def _check_hedge_triggers(open_positions: dict) -> None:
     now = time.time()
     triggers: list[str] = []
 
+    # get base symbol from trigger_symbol if provided
+    base_sym = trigger_symbol.split("/")[0].lower() if trigger_symbol else ""
+
     for condition_id, position in open_positions.items():
         # Skip already-hedged positions (idempotency guard)
         if condition_id in _HEDGED_POSITIONS:
             continue
 
         symbol: str = position.get("symbol", "")
+        
+        # If event-driven, only check positions for the symbol that just ticked
+        if base_sym and symbol.lower() != base_sym:
+            continue
+            
         side: str = position.get("side", "")
         ptb: float = position.get("price_to_beat", 0.0)   # epoch open_price
         entry_time: float = position.get("entry_time", 0.0)
@@ -492,25 +500,48 @@ async def _check_hedge_triggers(open_positions: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Evaluation loop
+# Event-driven evaluation
 # ---------------------------------------------------------------------------
 
-async def _evaluate_once(markets: dict, queue: asyncio.Queue) -> int:
-    """One evaluation pass. Returns signals generated."""
+_execution_queue: asyncio.Queue | None = None
+
+async def on_oracle_tick(symbol: str) -> None:
+    """Event-driven callback fired immediately by the oracle when a new price arrives."""
     # ── Stale Cache Guard ────────────────────────────────────────────────────
-    # If the WebSocket is not live, the order book may be a frozen REST snapshot.
-    # Never generate a signal against stale data.
     if not clob_cache.is_connected():
-        return 0
+        return
     # ─────────────────────────────────────────────────────────────────────────
+
+    if _execution_queue is None:
+        return
+
+    # Check hedges first (fast)
+    if _hedge_callback is not None and _get_open_positions_fn is not None:
+        try:
+            open_positions = _get_open_positions_fn()
+            if open_positions:
+                await _check_hedge_triggers(open_positions, trigger_symbol=symbol)
+        except Exception as exc:
+            print(f"{Fore.RED}[SIGNAL] Hedge check error: {exc}")
+
+    # Evaluate markets for the specific symbol that just ticked
+    markets = get_active_markets()
     generated = 0
     generated_this_pass: set[str] = set()
+    
+    # symbol comes in as 'btc/usd', we just want 'btc'
+    base_sym = symbol.split("/")[0].lower()
+
     for market in markets.values():
+        if market.get("symbol", "").lower() != base_sym:
+            continue
+
         try:
             signal = _evaluate_market(market)
         except Exception as exc:
             print(f"{Fore.RED}[SIGNAL] Error evaluating {market.get('condition_id', '?')}: {exc}")
             continue
+
         if signal:
             key = signal["symbol"] + signal["side"]
             if key in generated_this_pass:
@@ -518,38 +549,43 @@ async def _evaluate_once(markets: dict, queue: asyncio.Queue) -> int:
             generated_this_pass.add(key)
             SIGNALED_MARKETS.add(signal["condition_id"])
             _record_signal(signal)
-            _emit_signal(signal)
+            
+            # Print signal banner
+            slug = market.get("slug", signal["condition_id"])[-28:]
+            print(f"\n{Fore.GREEN}{Style.BRIGHT}[SIGNAL] *** SIGNAL FIRED ***")
+            print(f"  Market       : {market.get('question', slug)}")
+            
             # ── Queue delivery (Fix #1): zero-lag hand-off to trader ──────────
-            await queue.put(signal)
+            # We don't await queue.put() if it might block, but asyncio.Queue is unbuffered and non-blocking here
+            try:
+                _execution_queue.put_nowait(signal)
+            except asyncio.QueueFull:
+                await _execution_queue.put(signal)
             # ─────────────────────────────────────────────────────────────────
             generated += 1
-    return generated
 
+
+# ---------------------------------------------------------------------------
+# Maintenance loop
+# ---------------------------------------------------------------------------
 
 async def run_signal_engine(queue: asyncio.Queue) -> None:
-    """Evaluate all active markets and open-position hedge triggers every second."""
-    global _last_diag_ts
+    """Run periodic maintenance (diagnostics, cleanup). The heavy lifting is now event-driven."""
+    global _last_diag_ts, _execution_queue
+    _execution_queue = queue
 
     print(
         f"{Fore.WHITE}[SIGNAL] Signal engine started "
-        f"(eval every {EVAL_INTERVAL_SECONDS}s, diag every {DIAGNOSTIC_INTERVAL_SECONDS}s, "
+        f"(EVENT DRIVEN, diag every {DIAGNOSTIC_INTERVAL_SECONDS}s, "
         f"hedge window={HEDGE_WINDOW_SECONDS}s)."
     )
 
     while True:
         try:
-            # ── Stale Cache Guard ────────────────────────────────────────────
-            # Hard gate: the WebSocket MUST be live before any evaluation runs.
-            # If WS has dropped, the order book cache may be a frozen REST
-            # snapshot — trading on it would be the "Stale Cache Trap".
             if not clob_cache.is_connected():
-                print(
-                    f"{Fore.RED}[SIGNAL] ⚠️  WS DISCONNECTED — cache may be stale. "
-                    f"All signal evaluation BLOCKED until reconnect."
-                )
+                # print blocked message only occasionally to avoid spam
                 await asyncio.sleep(EVAL_INTERVAL_SECONDS)
                 continue
-            # ─────────────────────────────────────────────────────────────────
 
             _maybe_clear_signaled_markets()
             prune_expired_markets()
@@ -560,20 +596,8 @@ async def run_signal_engine(queue: asyncio.Queue) -> None:
                 _print_diagnostics(markets)
                 _last_diag_ts = time.time()
 
-            # ── Phase 3: Escape Hatch ─────────────────────────────────────────
-            if _hedge_callback is not None and _get_open_positions_fn is not None:
-                try:
-                    open_positions: dict = _get_open_positions_fn()
-                    if open_positions:
-                        await _check_hedge_triggers(open_positions)
-                except Exception as exc:
-                    print(f"{Fore.RED}[SIGNAL] Hedge check error: {exc}")
-            # ─────────────────────────────────────────────────────────────────
-
-            generated = await _evaluate_once(markets, queue)
-
         except Exception as exc:
-            print(f"{Fore.RED}[SIGNAL] Unexpected error: {exc}")
+            print(f"{Fore.RED}[SIGNAL] Unexpected error in maintenance: {exc}")
 
         await asyncio.sleep(EVAL_INTERVAL_SECONDS)
 

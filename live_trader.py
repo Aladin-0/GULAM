@@ -117,6 +117,7 @@ LIVE_STATE: dict = {
     "daily_profit": 0.0,
     "daily_trades": 0,
     "open_positions": {},   # condition_id → position dict
+    "coin_stats": {},
     "trade_history": [],
 }
 
@@ -150,6 +151,7 @@ def _live_persist_state() -> None:
         f"{_LIVE_PREFIX}total_lost_usd": LIVE_STATE["total_lost_usd"],
         f"{_LIVE_PREFIX}daily_profit": LIVE_STATE["daily_profit"],
         f"{_LIVE_PREFIX}daily_trades": LIVE_STATE["daily_trades"],
+        f"{_LIVE_PREFIX}coin_stats": LIVE_STATE["coin_stats"],
     }
     import json
     conn.executemany(
@@ -172,6 +174,7 @@ def _live_load_state() -> None:
     LIVE_STATE["total_lost_usd"] = _load_scalar(f"{_LIVE_PREFIX}total_lost_usd", 0.0)
     LIVE_STATE["daily_profit"] = _load_scalar(f"{_LIVE_PREFIX}daily_profit", 0.0)
     LIVE_STATE["daily_trades"] = _load_scalar(f"{_LIVE_PREFIX}daily_trades", 0)
+    LIVE_STATE["coin_stats"] = _load_scalar(f"{_LIVE_PREFIX}coin_stats", {})
     recovered = _load_all_positions()
     if recovered:
         LIVE_STATE["open_positions"].update(recovered)
@@ -217,6 +220,7 @@ def get_performance_summary() -> dict:
         "loss_count": LIVE_STATE["loss_count"],
         "total_lost_usd": LIVE_STATE["total_lost_usd"],
         "open_positions": len(LIVE_STATE["open_positions"]),
+        "coin_stats": LIVE_STATE["coin_stats"],
     }
 
 
@@ -262,11 +266,11 @@ def _compute_position_size() -> float:
     return total_equity * Config.MAX_POSITION_SIZE_PCT
 
 
-async def _verify_order_filled(order_id: str, token_id: str, max_wait: float = 30.0) -> float:
+async def _verify_order_filled(order_id: str, token_id: str, max_wait: float = 30.0) -> tuple[float, dict]:
     """
     Poll the CLOB to confirm an order was actually FILLED.
 
-    Returns the filled size (shares) if confirmed filled, or 0.0 if the order
+    Returns the filled size (shares) and order_resp if confirmed filled, or (0.0, {}) if the order
     was cancelled, expired, or still open after max_wait seconds.
     This is the KEY guard: we only record a position after Polymarket confirms the fill.
     """
@@ -284,13 +288,13 @@ async def _verify_order_filled(order_id: str, token_id: str, max_wait: float = 3
                 status = order_resp.get("status", "").upper()
                 size_matched = float(order_resp.get("size_matched", 0) or 0)
                 if status in ("MATCHED", "FILLED") or size_matched > 0:
-                    return size_matched
+                    return size_matched, order_resp
                 if status in ("CANCELLED", "EXPIRED", "UNMATCHED"):
                     print(
                         f"{Fore.YELLOW}[LIVE] Order {order_id[:16]}... status={status} — NOT filled. "
                         f"No position recorded. Capital returned."
                     )
-                    return 0.0
+                    return 0.0, order_resp
         except Exception as exc:  # pylint: disable=broad-except
             print(f"{Fore.YELLOW}[LIVE] Fill check error: {type(exc).__name__} — retrying...")
 
@@ -300,7 +304,7 @@ async def _verify_order_filled(order_id: str, token_id: str, max_wait: float = 3
         f"{Fore.YELLOW}[LIVE] Order {order_id[:16]}... fill unconfirmed after {max_wait:.0f}s — "
         f"treating as NOT filled. Check Polymarket dashboard."
     )
-    return 0.0
+    return 0.0, {}
 
 
 async def _place_order(signal: dict, size_usd: float) -> dict | None:
@@ -334,8 +338,10 @@ async def _place_order(signal: dict, size_usd: float) -> dict | None:
                 if 0.0 < best_ask < 1.0:
                     # NOTE: We ALWAYS place a Side.BUY order for the specific token (UP or DOWN).
                     # Therefore, we ALWAYS buy from the `asks` book. 
-                    # Add a 1-tick (0.01) slippage buffer to cross the spread and guarantee our FAK order fills.
-                    _taker_price = best_ask + 0.01
+                    # Deep Sweep: Market makers pull liquidity in the final 60s. We sweep the
+                    # entire orderbook up to $0.96. Since the oracle guarantees a win,
+                    # ANY fill under $0.96 is pure profit. We don't care about the best ask anymore.
+                    _taker_price = 0.96
             except (ValueError, TypeError):
                 pass
     entry_price: float = round(
@@ -464,32 +470,68 @@ async def _open_live_position(signal: dict) -> None:
         )
         return
 
-    entry_price: float = signal["entry_price"]
-    if entry_price <= 0:
+    # Reserve capital instantly so concurrent signals don't double-spend
+    if LIVE_STATE["available_capital"] < size_usd:
+        print(f"{Fore.YELLOW}[LIVE] Insufficient available capital for position (${size_usd:.2f})")
         return
+        
+    LIVE_STATE["available_capital"] -= size_usd
 
-    resp = await _place_order(signal, size_usd)
-    if resp is None:
-        return  # order failed — no state change
+    try:
+        entry_price: float = signal["entry_price"]
+        if entry_price <= 0:
+            LIVE_STATE["available_capital"] += size_usd # Refund
+            return
 
-    order_id = resp.get("orderID", resp.get("order_id", ""))
+        resp = await _place_order(signal, size_usd)
+        if resp is None:
+            LIVE_STATE["available_capital"] += size_usd # Refund
+            return  # order failed — no state change
 
-    # ── FILL VERIFICATION (the critical fix) ─────────────────────────────────
-    # Do NOT record a position until Polymarket confirms the order was matched.
-    # This prevents the bot from counting unfilled orders as real positions.
-    filled_shares = await _verify_order_filled(order_id, signal["token_id"], max_wait=60.0)
-    if filled_shares <= 0:
-        print(
-            f"{Fore.RED}[LIVE] ✗ Order NOT FILLED — {signal['symbol'].upper()} {signal['side']} "
-            f"skipped. No position recorded. Capital unchanged."
-        )
+        order_id = resp.get("orderID", resp.get("order_id", ""))
+
+        # ── FILL VERIFICATION (the critical fix) ─────────────────────────────────
+        # Do NOT record a position until Polymarket confirms the order was matched.
+        # This prevents the bot from counting unfilled orders as real positions.
+        filled_shares, order_resp = await _verify_order_filled(order_id, signal["token_id"], max_wait=60.0)
+        if filled_shares <= 0:
+            print(
+                f"{Fore.RED}[LIVE] ✗ Order NOT FILLED — {signal['symbol'].upper()} {signal['side']} "
+                f"skipped. No position recorded. Capital unchanged."
+            )
+            LIVE_STATE["available_capital"] += size_usd # Refund
+            return
+        # ─────────────────────────────────────────────────────────────────────────
+
+        # Use actual filled shares (may differ from requested due to partial fills)
+        shares = filled_shares
+        
+        # Determine actual cost from FAK execution math
+        requested_shares = float(order_resp.get("original_size", 0) or 0)
+        if shares >= requested_shares and requested_shares > 0:
+            # Full collateral consumed (possibly with price improvement yielding more shares)
+            cost = size_usd
+        else:
+            # Partial fill: spent proportionally less. Assuming limit price was hit.
+            limit_price = float(order_resp.get("price", entry_price) or entry_price)
+            cost = shares * limit_price
+
+        # Update entry_price to the REAL effective average execution price
+        entry_price = cost / shares if shares > 0 else entry_price
+
+        clob_entry_fee = cost * Config.CLOB_FEE_PCT
+        
+        # Refund any unspent capital (from partial fill)
+        actual_spent = cost + clob_entry_fee
+        if actual_spent < size_usd:
+            LIVE_STATE["available_capital"] += (size_usd - actual_spent)
+        elif actual_spent > size_usd:
+            LIVE_STATE["available_capital"] -= (actual_spent - size_usd)
+
+    except Exception as e:
+        print(f"{Fore.RED}[LIVE] Unexpected error during execution: {e}. Refunding ${size_usd:.2f}")
+        LIVE_STATE["available_capital"] += size_usd
         return
-    # ─────────────────────────────────────────────────────────────────────────
-
-    # Use actual filled shares (may differ from requested due to partial fills)
-    shares = filled_shares
-    cost = shares * entry_price
-    clob_entry_fee = cost * Config.CLOB_FEE_PCT
 
     position = {
         "condition_id": condition_id,
@@ -509,7 +551,6 @@ async def _open_live_position(signal: dict) -> None:
     }
 
     LIVE_STATE["open_positions"][condition_id] = position
-    LIVE_STATE["available_capital"] -= cost + clob_entry_fee
     LIVE_STATE["capital"] = (
         LIVE_STATE["available_capital"]
         + sum(p["cost"] for p in LIVE_STATE["open_positions"].values())
@@ -685,12 +726,22 @@ def _record_settlement(condition_id: str, exit_price: float, reason: str) -> Non
     LIVE_STATE["total_trades"] += 1
     LIVE_STATE["daily_trades"] += 1
 
+    sym = position.get("symbol", "UNKNOWN").upper()
+    if sym not in LIVE_STATE["coin_stats"]:
+        LIVE_STATE["coin_stats"][sym] = {"trades": 0, "wins": 0, "losses": 0, "profit": 0.0, "loss_usd": 0.0}
+    LIVE_STATE["coin_stats"][sym]["trades"] += 1
+
     if is_win:
         LIVE_STATE["winning_trades"] += 1
+        LIVE_STATE["coin_stats"][sym]["wins"] += 1
+        LIVE_STATE["coin_stats"][sym]["profit"] += net_profit
     else:
         LIVE_STATE["losing_trades"] += 1
         LIVE_STATE["loss_count"] += 1
         LIVE_STATE["total_lost_usd"] += abs(net_profit)
+        LIVE_STATE["coin_stats"][sym]["losses"] += 1
+        LIVE_STATE["coin_stats"][sym]["profit"] -= abs(net_profit)
+        LIVE_STATE["coin_stats"][sym]["loss_usd"] += abs(net_profit)
 
     trade_record = {
         "condition_id": condition_id,
@@ -1012,14 +1063,18 @@ async def run_live_trader(queue: asyncio.Queue) -> None:
         """Consume signals from the shared asyncio.Queue as they arrive."""
         while True:
             signal = await queue.get()
-            try:
-                _maybe_daily_reset()
-                if not _trading_halted and not _check_daily_loss_limit():
-                    await _open_live_position(signal)
-            except Exception as exc:  # pylint: disable=broad-except
-                print(f"{Fore.RED}[LIVE] Error processing signal: {type(exc).__name__} (details suppressed)")
-            finally:
-                queue.task_done()
+
+            async def _process_signal(sig: dict) -> None:
+                try:
+                    _maybe_daily_reset()
+                    if not _trading_halted and not _check_daily_loss_limit():
+                        await _open_live_position(sig)
+                except Exception as exc:  # pylint: disable=broad-except
+                    print(f"{Fore.RED}[LIVE] Error processing signal: {type(exc).__name__} (details suppressed)")
+                finally:
+                    queue.task_done()
+
+            asyncio.create_task(_process_signal(signal))
 
     async def _position_monitor() -> None:
         """Background task: settle positions and print periodic summaries."""
@@ -1042,6 +1097,19 @@ async def run_live_trader(queue: asyncio.Queue) -> None:
                         f"({summary['total_trades']} trades)\n"
                         f"{Fore.CYAN}  Open       : {summary['open_positions']} position(s)\n"
                     )
+                    
+                    if summary.get("coin_stats"):
+                        print(f"{Fore.CYAN}  ─── COIN BREAKDOWN ───")
+                        for coin, c_stat in summary["coin_stats"].items():
+                            c_sign = "+" if c_stat["profit"] >= 0 else ""
+                            c_wr = (c_stat["wins"] / c_stat["trades"] * 100) if c_stat["trades"] > 0 else 0
+                            print(
+                                f"{Fore.CYAN}  [{coin}]  Trades: {c_stat['trades']}  |  "
+                                f"Win Rate: {c_wr:.1f}%  |  "
+                                f"Profit: {c_sign}${c_stat['profit']:.4f}  |  "
+                                f"Lost: -${c_stat['loss_usd']:.4f}"
+                            )
+                        print(f"{Fore.CYAN}{'═' * 54}\n")
                     last_summary_ts = time.time()
             except Exception as exc:  # pylint: disable=broad-except
                 print(f"{Fore.RED}[LIVE] Monitor error: {type(exc).__name__} (details suppressed)")
