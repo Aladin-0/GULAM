@@ -21,7 +21,7 @@ ASSETS = ["btc", "eth", "sol"]   # XRP removed: no Chainlink oracle feed
 INTERVAL_SECONDS = 900          # 15 minutes
 REFRESH_INTERVAL_SECONDS = 30
 RETRY_WAIT_SECONDS = 10
-MAX_TIME_REMAINING_MINUTES = 30  # accept current + next upcoming market
+MAX_TIME_REMAINING_MINUTES = 90  # accept up to 90 minutes for Hourly markets
 SLUG_FETCH_RETRIES = 3          # max per-slug retry attempts
 SLUG_FETCH_BASE_DELAY = 5.0     # seconds — doubles on each retry (5s, 10s, 20s)
 
@@ -66,15 +66,50 @@ def _current_slot_ts() -> int:
     return int(slot_time.timestamp())
 
 
+def _hourly_slug(asset: str, dt_et: datetime) -> str:
+    """Generate slug like 'bitcoin-up-or-down-june-6-2026-1pm-et'"""
+    asset_map = {"btc": "bitcoin", "eth": "ethereum", "sol": "solana"}
+    name = asset_map.get(asset, asset)
+    month = dt_et.strftime('%B').lower()
+    day = dt_et.day
+    year = dt_et.year
+    hour = dt_et.strftime('%I').lstrip('0')
+    am_pm = dt_et.strftime('%p').lower()
+    return f"{name}-up-or-down-{month}-{day}-{year}-{hour}{am_pm}-et"
+
+
 def _slugs_to_fetch() -> list[tuple[str, str]]:
-    """Return (asset, slug) pairs for 4 time offsets × 3 assets = 12 slugs."""
+    """Return (asset, slug) pairs for 15-minute and Hourly markets."""
     base = _current_slot_ts()
     offsets = (0, INTERVAL_SECONDS, -INTERVAL_SECONDS, 2 * INTERVAL_SECONDS)
     pairs: list[tuple[str, str]] = []
+    
+    # 1. 15-minute markets
     for asset in ASSETS:
         for offset in offsets:
             ts = base + offset
             pairs.append((asset, f"{asset}-updown-15m-{ts}"))
+            
+    # 2. Hourly markets
+    try:
+        from zoneinfo import ZoneInfo
+        from datetime import timedelta
+        tz_et = ZoneInfo("America/New_York")
+        now_et = datetime.now(timezone.utc).astimezone(tz_et)
+        
+        # Current hour, next hour, and previous hour
+        hours = [
+            now_et - timedelta(hours=1),
+            now_et,
+            now_et + timedelta(hours=1)
+        ]
+        
+        for asset in ASSETS:
+            for h_dt in hours:
+                pairs.append((asset, _hourly_slug(asset, h_dt)))
+    except Exception as e:
+        print(f"[SCANNER] Failed to generate hourly slugs: {e}")
+        
     return pairs
 
 
