@@ -379,7 +379,7 @@ async def _place_order(signal: dict, size_usd: float) -> dict | None:
                 client.create_and_post_order,
                 order_args,
                 PartialCreateOrderOptions(tick_size="0.01"),
-                OrderType.FOK,   # Fill-Or-Kill: fills at exact price or auto-cancels (library equiv of IOC)
+                OrderType.FAK,   # Fill-And-Kill: executes available liquidity immediately, cancels rest (true IOC)
             ),
             timeout=10.0,
         )
