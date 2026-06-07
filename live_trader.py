@@ -791,33 +791,11 @@ async def _fetch_actual_payout(token_id: str, order_id: str, position: dict) -> 
     Determine the REAL outcome of a settled Polymarket position.
 
     Strategy (in order of reliability):
-      1. Oracle price vs price_to_beat — fast, accurate once market ends.
-      2. CLOB get_trades(TradeParams) — confirms via on-chain trade records.
-      3. CLOB get_order(order_id)    — last resort status check.
+      1. CLOB get_trades(TradeParams) — confirms via on-chain trade records.
+      2. CLOB get_order(order_id)    — last resort status check.
 
     Returns 1.0 (win), 0.0 (loss), or None (not yet settled — defer).
     """
-    from oracle import LATEST_PRICES
-
-    # ── Method 1: Oracle price vs price_to_beat (most reliable) ──────────────
-    # Once the 15-min market closes, oracle IS the settlement price.
-    oracle_key = f"{position['symbol'].lower()}/usd"
-    oracle_entry = LATEST_PRICES.get(oracle_key, {})
-    oracle_price: float = oracle_entry.get("price", 0.0)
-    ptb: float = position.get("price_to_beat", 0.0)
-
-    if oracle_price > 0 and ptb > 0:
-        if position["side"] == "UP":
-            is_win = oracle_price > ptb
-        else:
-            is_win = oracle_price < ptb
-        result = 1.0 if is_win else 0.0
-        print(
-            f"{Fore.CYAN}[LIVE] Oracle settlement: {position['symbol'].upper()} "
-            f"{position['side']} | price={oracle_price:.2f} ptb={ptb:.2f} "
-            f"→ {'WIN ✅' if is_win else 'LOSS ❌'}"
-        )
-        return result
 
     # ── Method 2: CLOB get_trades with correct TradeParams ───────────────────
     client = _get_client()

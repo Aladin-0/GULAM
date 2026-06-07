@@ -194,16 +194,16 @@ def _evaluate_market(market: dict) -> dict | None:
     # (Time constraint handled by c2 condition below)
     move_pct: float = (current_price - price_to_beat) / price_to_beat
 
-    # ── FADE THE PREMIUM STRATEGY ──────────────────────────────────────────
-    # We want to buy the LOSING side when a massive wick happens.
+    # ── LATENCY ARBITRAGE STRATEGY ─────────────────────────────────────────
+    # We want to buy the WINNING side when a massive wick happens.
     if current_price >= price_to_beat:
-        correct_side = "DOWN"
-        token_id: str = market["down_token_id"]
-        _static_token_price: float = market["down_price"]
-    else:
         correct_side = "UP"
-        token_id = market["up_token_id"]
-        _static_token_price = market["up_price"]
+        token_id: str = market["up_token_id"]
+        _static_token_price: float = market["up_price"]
+    else:
+        correct_side = "DOWN"
+        token_id = market["down_token_id"]
+        _static_token_price = market["down_price"]
 
     # ── Live token price resolution (Fix #3) ─────────────────────────────────
     # Prefer the live CLOB WebSocket cache over the 30-second Gamma REST snapshot.
@@ -223,20 +223,15 @@ def _evaluate_market(market: dict) -> dict | None:
                 pass  # fall back to static price
     # ─────────────────────────────────────────────────────────────────────────
 
-    c1 = abs(move_pct) >= 0.0009     # A strong 0.09% wick
-    c2 = t_left_s >= 300             # At least 5 minutes left
-    c3 = token_price <= 0.35         # Token dropped to 35 cents or lower
+    dynamic_need_pct = Config.BASE_GAP_BPS / 10000.0
+    risk_multiplier = 1.0
+
+    c1 = abs(move_pct) >= dynamic_need_pct
+    c2 = t_left_s <= 180
+    c3 = token_price <= 0.75
     
-    # ── Orderbook Wall Verification ──────────────────────────────────────────
-    # Check the Binance orderbook to verify the whale stopped buying/selling.
-    # imbalance = bids / (bids + asks).
-    imbalance: float = entry.get("imbalance", 0.5)
-    if correct_side == "DOWN":
-        # Oracle spiked UP. We need a SELL WALL to push it back down.
-        c4 = imbalance < 0.35
-    else:
-        # Oracle crashed DOWN. We need a BUY WALL to push it back up.
-        c4 = imbalance > 0.65
+    # ── Phantom Orderbook Block Neutralized ──────────────────────────────────
+    c4 = True
 
     if not (c1 and c2 and c3 and c4):
         return None

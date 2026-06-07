@@ -90,25 +90,25 @@ def _slugs_to_fetch() -> list[tuple[str, str]]:
             ts = base + offset
             pairs.append((asset, f"{asset}-updown-15m-{ts}"))
             
-    # 2. Hourly markets
-    try:
-        from zoneinfo import ZoneInfo
-        from datetime import timedelta
-        tz_et = ZoneInfo("America/New_York")
-        now_et = datetime.now(timezone.utc).astimezone(tz_et)
-        
-        # Current hour, next hour, and previous hour
-        hours = [
-            now_et - timedelta(hours=1),
-            now_et,
-            now_et + timedelta(hours=1)
-        ]
-        
-        for asset in ASSETS:
-            for h_dt in hours:
-                pairs.append((asset, _hourly_slug(asset, h_dt)))
-    except Exception as e:
-        print(f"[SCANNER] Failed to generate hourly slugs: {e}")
+    # 2. Hourly markets (Temporarily disabled pending Oracle upgrade)
+    # try:
+    #     from zoneinfo import ZoneInfo
+    #     from datetime import timedelta
+    #     tz_et = ZoneInfo("America/New_York")
+    #     now_et = datetime.now(timezone.utc).astimezone(tz_et)
+    #     
+    #     # Current hour, next hour, and previous hour
+    #     hours = [
+    #         now_et - timedelta(hours=1),
+    #         now_et,
+    #         now_et + timedelta(hours=1)
+    #     ]
+    #     
+    #     for asset in ASSETS:
+    #         for h_dt in hours:
+    #             pairs.append((asset, _hourly_slug(asset, h_dt)))
+    # except Exception as e:
+    #     print(f"[SCANNER] Failed to generate hourly slugs: {e}")
         
     return pairs
 
