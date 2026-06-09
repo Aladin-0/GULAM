@@ -13,39 +13,16 @@ bot_state.db
 bot_state.db-shm
 bot_state.db-wal
 
-# Python
+# Rust / Cargo
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Python (legacy)
 __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
 *.so
-*.egg
-*.egg-info/
-dist/
-build/
-.eggs/
-
-# Virtual environments
 .venv/
-venv/
-env/
-ENV/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Logs
 *.log
-logs/
-
-# Coverage / testing
-.coverage
-htmlcov/
-.pytest_cache/

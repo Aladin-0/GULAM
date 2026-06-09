@@ -1,0 +1,30 @@
+[package]
+name = "gulam_core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.0", features = ["full"] }
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+futures-util = "0.3"
+chrono = "0.4"
+dotenv = "0.15"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+ethers = { version = "2.0", features = ["rustls"] }
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.21"
+hex = "0.4"
+itoa = "1.0"
+rusqlite = { version = "0.31", features = ["bundled"] }
+async-trait = "0.1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[features]
+diagnostics = []
