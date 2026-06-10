@@ -189,8 +189,8 @@ pub async fn run_scanner(scanner: Scanner) {
                 _ => continue,
             };
 
-            println!("[SCANNER] ✅ {} → {} | {:.1}min remaining | ACCEPTED",
-                slug, raw.question, time_remaining_seconds / 60.0);
+            // println!("[SCANNER] ✅ {} → {} | {:.1}min remaining | ACCEPTED",
+            //     slug, raw.question, time_remaining_seconds / 60.0);
 
             let m = Market {
                 condition_id: raw.condition_id.clone(),
@@ -223,11 +223,13 @@ pub async fn run_scanner(scanner: Scanner) {
         }
         scanner.prune_expired_markets().await;
 
+        /*
         if count > 0 {
             println!("[SCANNER] {} active 15-min market(s) tracked.", count);
         } else {
             println!("[SCANNER] ⚠️ No active 15-min markets found this cycle.");
         }
+        */
 
         tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
     }

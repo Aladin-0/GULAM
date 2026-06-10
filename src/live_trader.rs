@@ -20,6 +20,7 @@ pub struct LiveTrader {
     pub oracle: OracleCache,
     pub exec_ctx: ExecutionContext,
     pub client: Client,
+    pub atomic_capital: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl LiveTrader {
@@ -29,6 +30,7 @@ impl LiveTrader {
         live_state: Arc<RwLock<LiveState>>,
         orderbook: OrderbookCache,
         oracle: OracleCache,
+        atomic_capital: Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         let exec_ctx = ExecutionContext::new(&config);
         Self {
@@ -39,6 +41,7 @@ impl LiveTrader {
             oracle,
             exec_ctx,
             client: Client::new(),
+            atomic_capital,
         }
     }
 
@@ -48,6 +51,10 @@ impl LiveTrader {
             return;
         }
         println!("[TRADER] Running startup balance sync...");
+        self.sync_live_balance().await;
+    }
+
+    pub async fn sync_live_balance(&self) {
         let headers = generate_level_1_headers("GET", "/balance-allowance", "", &self.exec_ctx.creds, &self.exec_ctx.eoa_signer_address, &self.exec_ctx.api_secret_bytes);
         let url = format!("{}/balance-allowance?asset_type=COLLATERAL&signature_type={}", self.config.polymarket_host, self.config.polymarket_sig_type);
         
@@ -61,15 +68,16 @@ impl LiveTrader {
                         let reserved: f64 = state.open_positions.values().map(|p| p.cost).sum();
                         state.capital = actual_balance;
                         state.available_capital = actual_balance - reserved;
+                        self.atomic_capital.store(state.available_capital.to_bits(), std::sync::atomic::Ordering::Release);
                         self.state_store.save_scalar("live_available_capital", &state.available_capital);
-                        println!("[TRADER] Startup synced live balance: ${:.2} (Available: ${:.2})", actual_balance, state.available_capital);
+                        println!("[TRADER] 💰 Live balance synced from Polymarket: ${:.2} (Available: ${:.2})", actual_balance, state.available_capital);
                     }
                 }
             } else {
                 println!("[TRADER] ⚠️ Failed to parse balance-allowance.");
             }
         } else {
-            println!("[TRADER] ⚠️ Network error fetching startup balance.");
+            println!("[TRADER] ⚠️ Network error fetching live balance.");
         }
     }
 
@@ -272,6 +280,7 @@ impl LiveTrader {
         {
             let mut state = self.live_state.write().await;
             state.available_capital -= actual_cost;
+            self.atomic_capital.store(state.available_capital.to_bits(), std::sync::atomic::Ordering::Release);
             state.open_positions.insert(signal_mut.condition_id.clone(), position.clone());
             self.state_store.save_scalar("live_available_capital", &state.available_capital);
         }
@@ -295,13 +304,9 @@ impl LiveTrader {
             
             let mut exit_price = 0.0;
             if let Some(book) = self.orderbook.get_orderbook(&pos.token_id).await {
-                let mut best_bid = 0.0;
-                for p_str in book.bids.keys() {
-                    if let Ok(p) = p_str.parse::<f64>() {
-                        if p > best_bid { best_bid = p; }
-                    }
+                if let Some(&(p, _)) = book.bids.first() {
+                    exit_price = p;
                 }
-                exit_price = best_bid;
             }
             if exit_price <= 0.0 { exit_price = pos.entry_price * 0.99; }
             if exit_price < 0.0 { exit_price = 0.0; }
@@ -449,6 +454,7 @@ impl LiveTrader {
 
             let mut state = self.live_state.write().await;
             state.available_capital += pos.cost + net_profit;
+            self.atomic_capital.store(state.available_capital.to_bits(), std::sync::atomic::Ordering::Release);
             state.total_profit += net_profit;
             state.daily_profit += net_profit;
             state.total_trades += 1;
@@ -587,14 +593,36 @@ impl LiveTrader {
             }
 
             if remove {
-                let mut state = self.live_state.write().await;
-                state.open_positions.remove(&cid);
+                let mut state_cap = 0.0;
+                let is_paper = self.config.paper_trading;
+                {
+                    let mut state = self.live_state.write().await;
+                    state.open_positions.remove(&cid);
+                    if let Some(rec) = record_opt.as_ref() {
+                        if is_paper {
+                            state.available_capital += pos_cost + net_profit;
+                            self.atomic_capital.store(state.available_capital.to_bits(), std::sync::atomic::Ordering::Release);
+                            state.total_profit += net_profit;
+                            state.daily_profit += net_profit;
+                            state.total_trades += 1;
+                            state.daily_trades += 1;
+                            if net_profit > 0.0 { state.winning_trades += 1; }
+                            else { state.losing_trades += 1; state.loss_count += 1; state.total_lost_usd += net_profit.abs(); }
+                        }
+                        state.trade_history.push(rec.clone());
+                    }
+                    state_cap = state.available_capital;
+                }
+
+                if !is_paper {
+                    self.sync_live_balance().await;
+                    state_cap = self.live_state.read().await.available_capital;
+                }
+
                 if let Some(rec) = record_opt {
-                    state.trade_history.push(rec.clone());
                     let store = self.state_store.clone();
                     let rec_clone = rec.clone();
                     let cid_clone = cid.clone();
-                    let state_cap = state.available_capital;
                     tokio::task::spawn_blocking(move || {
                         store.save_trade_record(&rec_clone);
                         store.save_scalar("live_available_capital", &state_cap);
@@ -653,6 +681,7 @@ impl LiveTrader {
             {
                 let mut state = self.live_state.write().await;
                 state.available_capital -= actual_cost;
+                self.atomic_capital.store(state.available_capital.to_bits(), std::sync::atomic::Ordering::Release);
                 state.open_positions.insert(pending.signal.condition_id.clone(), position.clone());
                 self.state_store.save_scalar("live_available_capital", &state.available_capital);
             }
@@ -690,6 +719,7 @@ impl LiveTrader {
 
             let mut state = self.live_state.write().await;
             state.available_capital += pos.cost + net_profit;
+            self.atomic_capital.store(state.available_capital.to_bits(), std::sync::atomic::Ordering::Release);
             state.total_profit += net_profit;
             state.daily_profit += net_profit;
             state.total_trades += 1;

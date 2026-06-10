@@ -8,16 +8,16 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone)]
 pub struct Orderbook {
-    pub asks: HashMap<String, String>,
-    pub bids: HashMap<String, String>,
+    pub asks: Vec<(f64, f64)>, // Sorted ascending (lowest price first)
+    pub bids: Vec<(f64, f64)>, // Sorted descending (highest price first)
     pub last_updated: std::time::Instant,
 }
 
 impl Default for Orderbook {
     fn default() -> Self {
         Self {
-            asks: HashMap::new(),
-            bids: HashMap::new(),
+            asks: Vec::new(),
+            bids: Vec::new(),
             last_updated: std::time::Instant::now(),
         }
     }
@@ -86,25 +86,18 @@ impl OrderbookCache {
         self.connected.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    pub async fn validate_liquidity(
-        &self,
-        token_id: &str,
-        side: &str,
-        price: f64,
-        required_capital: f64,
-    ) -> (bool, f64) {
-        let book_opt = self.get_orderbook(token_id).await;
+    pub async fn validate_liquidity(&self, token_id: &str, side: &str, price: f64, required_capital: f64) -> (bool, f64) {
         let mut available_value = 0.0;
-
+        let book_opt = self.get_orderbook(token_id).await;
         if let Some(book) = book_opt {
             let levels = if side == "BUY" { &book.asks } else { &book.bids };
-            for (p_str, size_str) in levels {
-                if let (Ok(p), Ok(s)) = (p_str.parse::<f64>(), size_str.parse::<f64>()) {
-                    if side == "BUY" && p <= price {
-                        available_value += p * s;
-                    } else if side == "SELL" && p >= price {
-                        available_value += p * s;
-                    }
+            for &(p, s) in levels {
+                if side == "BUY" && p <= price {
+                    available_value += p * s;
+                } else if side == "SELL" && p >= price {
+                    available_value += p * s;
+                } else {
+                    break;
                 }
             }
         }
@@ -152,22 +145,11 @@ impl OrderbookCache {
     pub async fn calculate_sweep_price(&self, token_id: &str, side: &str, target_size: f64) -> Option<f64> {
         let book_opt = self.get_orderbook(token_id).await;
         if let Some(book) = book_opt {
-            let mut levels = Vec::new();
-            let source_map = if side == "BUY" { &book.asks } else { &book.bids };
-            for (p_str, size_str) in source_map {
-                if let (Ok(p), Ok(s)) = (p_str.parse::<f64>(), size_str.parse::<f64>()) {
-                    levels.push((p, s));
-                }
-            }
-            if side == "BUY" {
-                levels.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-            } else {
-                levels.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-            }
+            let levels = if side == "BUY" { &book.asks } else { &book.bids };
 
             let mut accumulated_size = 0.0;
             let mut sweep_price = None;
-            for (p, s) in levels {
+            for &(p, s) in levels {
                 accumulated_size += s;
                 sweep_price = Some(p);
                 if accumulated_size >= target_size {
@@ -177,6 +159,31 @@ impl OrderbookCache {
             return sweep_price;
         }
         None
+    }
+}
+
+fn update_level(levels: &mut Vec<(f64, f64)>, price: f64, size: f64, is_ask: bool) {
+    let search = levels.binary_search_by(|&(p, _)| {
+        if is_ask {
+            p.partial_cmp(&price).unwrap_or(std::cmp::Ordering::Equal)
+        } else {
+            price.partial_cmp(&p).unwrap_or(std::cmp::Ordering::Equal)
+        }
+    });
+
+    match search {
+        Ok(idx) => {
+            if size == 0.0 {
+                levels.remove(idx);
+            } else {
+                levels[idx].1 = size;
+            }
+        }
+        Err(idx) => {
+            if size > 0.0 {
+                levels.insert(idx, (price, size));
+            }
+        }
     }
 }
 
@@ -208,6 +215,7 @@ pub async fn run_orderbook_cache(ob_cache: OrderbookCache, mut sub_rx: mpsc::Rec
 
                 if !existing_tokens.is_empty() {
                     for chunk in existing_tokens.chunks(100) {
+                        if chunk.is_empty() { continue; }
                         let sub_msg = WsSubscribe {
                             assets_ids: chunk.to_vec(),
                             r#type: "market".to_string(),
@@ -222,6 +230,9 @@ pub async fn run_orderbook_cache(ob_cache: OrderbookCache, mut sub_rx: mpsc::Rec
                 let mut ping_interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
                 ping_interval.tick().await;
 
+                let mut heartbeat_interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+                heartbeat_interval.tick().await;
+
                 let mut last_parse_err = std::time::Instant::now();
                 let mut parse_err_count = 0;
 
@@ -230,7 +241,9 @@ pub async fn run_orderbook_cache(ob_cache: OrderbookCache, mut sub_rx: mpsc::Rec
                         Some(change) = sub_rx.recv() => {
                             match change {
                                 SubChange::Subscribe(tokens) => {
+                                    if tokens.is_empty() { continue; }
                                     for chunk in tokens.chunks(100) {
+                                        if chunk.is_empty() { continue; }
                                         let sub_msg = WsSubscribe {
                                             assets_ids: chunk.to_vec(),
                                             r#type: "market".to_string(),
@@ -250,7 +263,25 @@ pub async fn run_orderbook_cache(ob_cache: OrderbookCache, mut sub_rx: mpsc::Rec
                         _ = ping_interval.tick() => {
                             let _ = write.send(Message::Ping(vec![])).await;
                         }
-                        msg_res = tokio::time::timeout(tokio::time::Duration::from_secs(30), read.next()) => {
+                        _ = heartbeat_interval.tick() => {
+                            let existing_tokens: Vec<String> = {
+                                let set = ob_cache.active_tokens.read().await;
+                                set.iter().cloned().collect()
+                            };
+                            if !existing_tokens.is_empty() {
+                                for chunk in existing_tokens.chunks(100) {
+                                    if chunk.is_empty() { continue; }
+                                    let sub_msg = WsSubscribe {
+                                        assets_ids: chunk.to_vec(),
+                                        r#type: "market".to_string(),
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&sub_msg) {
+                                        let _ = write.send(Message::Text(json)).await;
+                                    }
+                                }
+                            }
+                        }
+                        msg_res = tokio::time::timeout(tokio::time::Duration::from_secs(120), read.next()) => {
                             match msg_res {
                                 Ok(Some(Ok(Message::Text(text)))) => {
                                     // Stable connection check
@@ -275,14 +306,16 @@ pub async fn run_orderbook_cache(ob_cache: OrderbookCache, mut sub_rx: mpsc::Rec
                                                 
                                                 if let Some(bids) = book_event.bids {
                                                     for b in bids {
-                                                        if b.size == "0" { entry.bids.remove(&b.price); }
-                                                        else { entry.bids.insert(b.price, b.size); }
+                                                        if let (Ok(price), Ok(size)) = (b.price.parse::<f64>(), b.size.parse::<f64>()) {
+                                                            update_level(&mut entry.bids, price, size, false);
+                                                        }
                                                     }
                                                 }
                                                 if let Some(asks) = book_event.asks {
                                                     for a in asks {
-                                                        if a.size == "0" { entry.asks.remove(&a.price); }
-                                                        else { entry.asks.insert(a.price, a.size); }
+                                                        if let (Ok(price), Ok(size)) = (a.price.parse::<f64>(), a.size.parse::<f64>()) {
+                                                            update_level(&mut entry.asks, price, size, true);
+                                                        }
                                                     }
                                                 }
                                             }
@@ -290,8 +323,8 @@ pub async fn run_orderbook_cache(ob_cache: OrderbookCache, mut sub_rx: mpsc::Rec
                                     } else {
                                         parse_err_count += 1;
                                         if last_parse_err.elapsed().as_secs() >= 60 {
-                                            let snippet = if text.len() > 100 { &text[..100] } else { &text };
-                                            println!("[ORDERBOOK-ERROR] WS Parse failed ({} times in 60s): {}", parse_err_count, snippet);
+                                            // let snippet = if text.len() > 100 { &text[..100] } else { &text };
+                                            // println!("[ORDERBOOK-ERROR] WS Parse failed ({} times in 60s): {}", parse_err_count, snippet);
                                             parse_err_count = 0;
                                             last_parse_err = std::time::Instant::now();
                                         }
@@ -307,7 +340,7 @@ pub async fn run_orderbook_cache(ob_cache: OrderbookCache, mut sub_rx: mpsc::Rec
                                 }
                                 Ok(None) => break,
                                 Err(_) => {
-                                    println!("[ORDERBOOK] WS silent drop detected (no messages/pings for 30s). Reconnecting...");
+                                    println!("[ORDERBOOK] WS silent drop detected (no messages/pings for 120s). Reconnecting...");
                                     break;
                                 }
                                 _ => {}

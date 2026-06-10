@@ -59,6 +59,7 @@ async fn main() {
     initial_state.available_capital = state_store.load_scalar("live_available_capital", config.initial_capital);
     initial_state.capital = initial_state.available_capital;
     initial_state.open_positions = state_store.load_all_positions();
+    let atomic_capital = Arc::new(std::sync::atomic::AtomicU64::new(initial_state.available_capital.to_bits()));
     let live_state = Arc::new(RwLock::new(initial_state));
 
     // Setup Shared Queues
@@ -77,6 +78,7 @@ async fn main() {
         oracle_cache.clone(),
         orderbook_cache.clone(),
         scanner.clone(),
+        atomic_capital.clone(),
     );
 
     let live_trader = Arc::new(LiveTrader::new(
@@ -85,6 +87,7 @@ async fn main() {
         live_state.clone(),
         orderbook_cache.clone(),
         oracle_cache.clone(),
+        atomic_capital.clone(),
     ));
 
 
@@ -120,16 +123,32 @@ async fn main() {
     let se_tx = signal_tx.clone();
     let he_tx = hedge_tx.clone();
     let ls = live_state.clone();
-    // signal_engine cannot be easily cloned if it's moved.
-    // In Python this was a single instance.
-    tokio::spawn(async move {
-        run_signal_engine(signal_engine, se_tx, ls, he_tx, tick_rx).await;
+    std::thread::spawn(move || {
+        if let Some(core_ids) = core_affinity::get_core_ids() {
+            if let Some(core) = core_ids.first() {
+                core_affinity::set_for_current(*core);
+                println!("[MAIN] Pinned SignalEngine to core {}", core.id);
+            }
+        }
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async move {
+            run_signal_engine(signal_engine, se_tx, ls, he_tx, tick_rx).await;
+        });
     });
 
     // Live Trader Task
     let lt = live_trader.clone();
-    tokio::spawn(async move {
-        run_live_trader(lt, signal_rx, hedge_rx).await;
+    std::thread::spawn(move || {
+        if let Some(core_ids) = core_affinity::get_core_ids() {
+            if let Some(core) = core_ids.last() {
+                core_affinity::set_for_current(*core);
+                println!("[MAIN] Pinned LiveTrader to core {}", core.id);
+            }
+        }
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async move {
+            run_live_trader(lt, signal_rx, hedge_rx).await;
+        });
     });
 
     let lt_fills = live_trader.clone();

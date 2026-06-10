@@ -18,6 +18,7 @@ pub struct SignalEngine {
     pub scanner: Scanner,
     pub signaled_markets: Arc<RwLock<HashSet<String>>>,
     pub signal_history: Arc<RwLock<Vec<Signal>>>,
+    pub atomic_capital: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl SignalEngine {
@@ -26,6 +27,7 @@ impl SignalEngine {
         oracle: OracleCache,
         orderbook: OrderbookCache,
         scanner: Scanner,
+        atomic_capital: Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         Self {
             config,
@@ -34,6 +36,7 @@ impl SignalEngine {
             scanner,
             signaled_markets: Arc::new(RwLock::new(HashSet::new())),
             signal_history: Arc::new(RwLock::new(Vec::new())),
+            atomic_capital,
         }
     }
 }
@@ -151,12 +154,12 @@ pub async fn run_signal_engine(
         }
         }
 
-        let tick_base = tick.symbol.split('/').next().unwrap_or("").to_uppercase();
+        let tick_base = tick.symbol.split('/').next().unwrap_or("");
 
         // Evaluate markets
-        let mut generated_this_pass = HashSet::new();
+        let mut generated_this_pass: HashSet<u64> = HashSet::new();
         for (_, market) in markets.iter() {
-            if market.symbol.to_uppercase() != tick_base { continue; }
+            if !market.symbol.eq_ignore_ascii_case(tick_base) { continue; }
 
             let cid = market.condition_id.clone();
             if engine.signaled_markets.read().await.contains(&cid) {
@@ -185,7 +188,7 @@ pub async fn run_signal_engine(
                 ("DOWN", &market.down_token_id, market.down_price)
             };
 
-            let current_capital = live_state.read().await.available_capital;
+            let current_capital = f64::from_bits(engine.atomic_capital.load(std::sync::atomic::Ordering::Acquire));
             let capital = if current_capital > engine.config.initial_capital { current_capital } else { engine.config.initial_capital };
             let required_capital = capital * engine.config.max_position_size_pct;
             let approx_shares = required_capital / static_token_price;
@@ -248,7 +251,12 @@ pub async fn run_signal_engine(
                 latency: Some(lat),
             };
 
-            let key = format!("{}{}", signal.symbol, signal.side);
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            signal.symbol.hash(&mut hasher);
+            signal.side.hash(&mut hasher);
+            let key = hasher.finish();
+
             if generated_this_pass.contains(&key) { continue; }
             generated_this_pass.insert(key);
 
@@ -262,10 +270,11 @@ pub async fn run_signal_engine(
                 }
             }
 
-            println!("\n[SIGNAL] *** SIGNAL FIRED *** | {} | {} | token: ${:.4}", signal.symbol, signal.side, signal.entry_price);
+            // (Commented out to remove hot path blocking I/O)
+            // println!("\n[SIGNAL] *** SIGNAL FIRED *** | {} | {} | token: ${:.4}", signal.symbol, signal.side, signal.entry_price);
             if let Err(e) = queue.try_send(signal) {
                 dropped_signals += 1;
-                println!("[SIGNAL] ⚠️ Trader queue full! Dropping signal to prevent backpressure (Total dropped: {}). Err: {}", dropped_signals, e);
+                // println!("[SIGNAL] ⚠️ Trader queue full! Dropping signal to prevent backpressure (Total dropped: {}). Err: {}", dropped_signals, e);
             }
         }
     }
