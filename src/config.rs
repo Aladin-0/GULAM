@@ -18,10 +18,12 @@ pub struct Config {
     pub polymarket_api_secret: String,
     pub polymarket_api_passphrase: String,
     pub polymarket_host: String,
-    pub chain_id: u64,
+
     pub private_key: String,
     pub polymarket_proxy_wallet: String,
     pub polymarket_sig_type: u64,
+    pub auth_identity_mode: String,
+    pub order_identity_mode: String,
 }
 
 impl Config {
@@ -44,10 +46,12 @@ impl Config {
             polymarket_api_secret: env::var("POLYMARKET_API_SECRET").unwrap_or_default(),
             polymarket_api_passphrase: env::var("POLYMARKET_API_PASSPHRASE").unwrap_or_default(),
             polymarket_host: env::var("POLYMARKET_HOST").unwrap_or_else(|_| "https://clob.polymarket.com".to_string()),
-            chain_id: env::var("CHAIN_ID").unwrap_or_else(|_| "137".to_string()).parse().unwrap_or(137),
+
             private_key: env::var("PRIVATE_KEY").unwrap_or_default(),
-            polymarket_proxy_wallet: env::var("POLYMARKET_PROXY_WALLET").unwrap_or_default(),
+            polymarket_proxy_wallet: env::var("POLYMARKET_PROXY_WALLET").or_else(|_| env::var("PROXY_WALLET")).unwrap_or_default(),
             polymarket_sig_type: env::var("POLYMARKET_SIG_TYPE").unwrap_or_else(|_| "3".to_string()).parse().unwrap_or(3),
+            auth_identity_mode: env::var("POLYMARKET_L1_ADDRESS_MODE").unwrap_or_else(|_| "PROXY".to_string()),
+            order_identity_mode: env::var("POLYMARKET_ORDER_IDENTITY_MODE").unwrap_or_else(|_| "PROXY".to_string()),
         }
     }
 }

@@ -23,22 +23,19 @@ impl Default for Orderbook {
     }
 }
 
+/// Single entry inside a price_change event from Polymarket market WS
 #[derive(Debug, Deserialize)]
-pub struct WsLevel {
-    pub price: String,
-    pub size: String,
+pub struct WsPriceChangeEntry {
+    pub asset_id: String,
+    pub best_ask: Option<String>,
+    pub best_bid: Option<String>,
 }
 
+/// Top-level message from wss://ws-subscriptions-clob.polymarket.com/ws/market
 #[derive(Debug, Deserialize)]
-pub struct WsBookEvent {
-    #[serde(rename = "event", default)]
-    pub event_type: Option<String>,
-    #[serde(default)]
-    pub asset_id: String,
-    pub bids: Option<Vec<WsLevel>>,
-    pub asks: Option<Vec<WsLevel>>,
-    #[serde(default)]
-    pub timestamp: String,
+pub struct WsPriceChangeEvent {
+
+    pub price_changes: Option<Vec<WsPriceChangeEntry>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -92,9 +89,7 @@ impl OrderbookCache {
         if let Some(book) = book_opt {
             let levels = if side == "BUY" { &book.asks } else { &book.bids };
             for &(p, s) in levels {
-                if side == "BUY" && p <= price {
-                    available_value += p * s;
-                } else if side == "SELL" && p >= price {
+                if (side == "BUY" && p <= price) || (side == "SELL" && p >= price) {
                     available_value += p * s;
                 } else {
                     break;
@@ -207,7 +202,10 @@ pub async fn run_orderbook_cache(ob_cache: OrderbookCache, mut sub_rx: mpsc::Rec
                 ob_cache.connected.store(true, std::sync::atomic::Ordering::Relaxed);
                 let (mut write, mut read) = ws_stream.split();
 
-                // Re-subscribe to all existing tokens upon connection
+                // Track tokens subscribed in THIS connection session to avoid re-subscribing (INVALID OPERATION)
+                let mut session_subscribed: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+                // Subscribe to all existing tokens on fresh connection
                 let existing_tokens: Vec<String> = {
                     let set = ob_cache.active_tokens.read().await;
                     set.iter().cloned().collect()
@@ -222,16 +220,15 @@ pub async fn run_orderbook_cache(ob_cache: OrderbookCache, mut sub_rx: mpsc::Rec
                         };
                         if let Ok(json) = serde_json::to_string(&sub_msg) {
                             let _ = write.send(Message::Text(json)).await;
+                            for t in chunk { session_subscribed.insert(t.clone()); }
                         }
                     }
                 }
 
                 let connected_at = std::time::Instant::now();
-                let mut ping_interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
-                ping_interval.tick().await;
-
-                let mut heartbeat_interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
-                heartbeat_interval.tick().await;
+                // Send text PING every 20s to keep connection alive (binary ping frames not always honoured)
+                let mut ping_interval = tokio::time::interval(tokio::time::Duration::from_secs(20));
+                ping_interval.tick().await; // skip first immediate tick
 
                 let mut last_parse_err = std::time::Instant::now();
                 let mut parse_err_count = 0;
@@ -242,7 +239,12 @@ pub async fn run_orderbook_cache(ob_cache: OrderbookCache, mut sub_rx: mpsc::Rec
                             match change {
                                 SubChange::Subscribe(tokens) => {
                                     if tokens.is_empty() { continue; }
-                                    for chunk in tokens.chunks(100) {
+                                    // Only subscribe to tokens NOT already subscribed in this session
+                                    let new_tokens: Vec<String> = tokens.into_iter()
+                                        .filter(|t| !session_subscribed.contains(t))
+                                        .collect();
+                                    if new_tokens.is_empty() { continue; }
+                                    for chunk in new_tokens.chunks(100) {
                                         if chunk.is_empty() { continue; }
                                         let sub_msg = WsSubscribe {
                                             assets_ids: chunk.to_vec(),
@@ -250,71 +252,66 @@ pub async fn run_orderbook_cache(ob_cache: OrderbookCache, mut sub_rx: mpsc::Rec
                                         };
                                         if let Ok(json) = serde_json::to_string(&sub_msg) {
                                             let _ = write.send(Message::Text(json)).await;
+                                            for t in chunk { session_subscribed.insert(t.clone()); }
                                         }
                                     }
                                 }
                                 SubChange::Unsubscribe(tokens) => {
-                                    // Gamma API or CLOB WS unsubscribe? We just omit them.
-                                    // (If Polymarket WS supports "unsubscribe" type, we can send it here).
-                                    // For now, we just removed them from `active_tokens` which handles it implicitly on reconnects.
+                                    // Remove from session tracking so reconnect won't skip them
+                                    for t in tokens { session_subscribed.remove(&t); }
                                 }
                             }
                         }
                         _ = ping_interval.tick() => {
-                            let _ = write.send(Message::Ping(vec![])).await;
+                            // Text PING — Polymarket echoes "PONG" which keeps connection alive
+                            let _ = write.send(Message::Text("PING".to_string())).await;
                         }
-                        _ = heartbeat_interval.tick() => {
-                            let existing_tokens: Vec<String> = {
-                                let set = ob_cache.active_tokens.read().await;
-                                set.iter().cloned().collect()
-                            };
-                            if !existing_tokens.is_empty() {
-                                for chunk in existing_tokens.chunks(100) {
-                                    if chunk.is_empty() { continue; }
-                                    let sub_msg = WsSubscribe {
-                                        assets_ids: chunk.to_vec(),
-                                        r#type: "market".to_string(),
-                                    };
-                                    if let Ok(json) = serde_json::to_string(&sub_msg) {
-                                        let _ = write.send(Message::Text(json)).await;
-                                    }
-                                }
-                            }
-                        }
-                        msg_res = tokio::time::timeout(tokio::time::Duration::from_secs(120), read.next()) => {
+                        // Shorten silence timeout to 45s — Polymarket drops at ~60s
+                        msg_res = tokio::time::timeout(tokio::time::Duration::from_secs(45), read.next()) => {
                             match msg_res {
                                 Ok(Some(Ok(Message::Text(text)))) => {
                                     // Stable connection check
                                     if connected_at.elapsed().as_secs() > 10 {
                                         backoff = 1; // Reset backoff
                                     }
-                                    if text.contains("\"message\":\"Successfully subscribed\"") {
+                                    // Skip PONG replies and subscription acks
+                                    if text == "PONG" || text.contains("\"message\":\"Successfully subscribed\"") {
                                         continue;
                                     }
                                     if let Ok(parsed_json) = serde_json::from_str::<serde_json::Value>(&text) {
+                                        // Skip empty arrays (subscription ack)
+                                        if parsed_json.is_array() && parsed_json.as_array().unwrap().is_empty() {
+                                            continue;
+                                        }
                                         let events = if parsed_json.is_array() {
                                             parsed_json.as_array().unwrap().clone()
                                         } else {
                                             vec![parsed_json]
                                         };
                                         for event_val in events {
-                                            if let Ok(book_event) = serde_json::from_value::<WsBookEvent>(event_val) {
-                                                if book_event.asset_id.is_empty() { continue; }
-                                                let mut w = ob_cache.cache.write().await;
-                                                let entry = w.entry(book_event.asset_id.clone()).or_default();
-                                                entry.last_updated = std::time::Instant::now();
-                                                
-                                                if let Some(bids) = book_event.bids {
-                                                    for b in bids {
-                                                        if let (Ok(price), Ok(size)) = (b.price.parse::<f64>(), b.size.parse::<f64>()) {
-                                                            update_level(&mut entry.bids, price, size, false);
+                                            // Polymarket sends price_change events with price_changes array
+                                            if let Ok(evt) = serde_json::from_value::<WsPriceChangeEvent>(event_val) {
+                                                if let Some(changes) = evt.price_changes {
+                                                    let mut w = ob_cache.cache.write().await;
+                                                    for change in changes {
+                                                        if change.asset_id.is_empty() { continue; }
+                                                        let entry = w.entry(change.asset_id.clone()).or_default();
+                                                        entry.last_updated = std::time::Instant::now();
+                                                        // Update best bid
+                                                        if let Some(bid_str) = change.best_bid {
+                                                            if let Ok(bid_price) = bid_str.parse::<f64>() {
+                                                                if bid_price > 0.0 {
+                                                                    update_level(&mut entry.bids, bid_price, 1.0, false);
+                                                                }
+                                                            }
                                                         }
-                                                    }
-                                                }
-                                                if let Some(asks) = book_event.asks {
-                                                    for a in asks {
-                                                        if let (Ok(price), Ok(size)) = (a.price.parse::<f64>(), a.size.parse::<f64>()) {
-                                                            update_level(&mut entry.asks, price, size, true);
+                                                        // Update best ask
+                                                        if let Some(ask_str) = change.best_ask {
+                                                            if let Ok(ask_price) = ask_str.parse::<f64>() {
+                                                                if ask_price > 0.0 {
+                                                                    update_level(&mut entry.asks, ask_price, 1.0, true);
+                                                                }
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -323,8 +320,8 @@ pub async fn run_orderbook_cache(ob_cache: OrderbookCache, mut sub_rx: mpsc::Rec
                                     } else {
                                         parse_err_count += 1;
                                         if last_parse_err.elapsed().as_secs() >= 60 {
-                                            // let snippet = if text.len() > 100 { &text[..100] } else { &text };
-                                            // println!("[ORDERBOOK-ERROR] WS Parse failed ({} times in 60s): {}", parse_err_count, snippet);
+                                            let snippet = if text.len() > 100 { &text[..100] } else { &text };
+                                            println!("[ORDERBOOK-ERROR] WS Parse failed ({} times in 60s): {}", parse_err_count, snippet);
                                             parse_err_count = 0;
                                             last_parse_err = std::time::Instant::now();
                                         }

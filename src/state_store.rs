@@ -38,14 +38,12 @@ impl StateStore {
 
     pub fn save_scalar<T: serde::Serialize>(&self, key: &str, value: &T) {
         if let Ok(json_val) = serde_json::to_string(value) {
-            tokio::task::block_in_place(|| {
-                let conn = self.conn.lock().unwrap();
-                let _ = conn.execute(
-                    "INSERT INTO paper_state (key, value) VALUES (?1, ?2)
-                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                    params![key, json_val],
-                );
-            });
+            let conn = self.conn.lock().unwrap();
+            let _ = conn.execute(
+                "INSERT INTO paper_state (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, json_val],
+            );
         }
     }
 
@@ -66,38 +64,32 @@ impl StateStore {
 
     pub fn save_position(&self, condition_id: &str, position: &Position) {
         if let Ok(json_val) = serde_json::to_string(position) {
-            tokio::task::block_in_place(|| {
-                let conn = self.conn.lock().unwrap();
-                let _ = conn.execute(
-                    "INSERT INTO positions (condition_id, data) VALUES (?1, ?2)
-                     ON CONFLICT(condition_id) DO UPDATE SET data = excluded.data",
-                    params![condition_id, json_val],
-                );
-            });
+            let conn = self.conn.lock().unwrap();
+            let _ = conn.execute(
+                "INSERT INTO positions (condition_id, data) VALUES (?1, ?2)
+                 ON CONFLICT(condition_id) DO UPDATE SET data = excluded.data",
+                params![condition_id, json_val],
+            );
         }
     }
 
     pub fn save_trade_record(&self, record: &crate::types::TradeRecord) {
         if let Ok(json_val) = serde_json::to_string(record) {
-            tokio::task::block_in_place(|| {
-                let conn = self.conn.lock().unwrap();
-                let _ = conn.execute(
-                    "INSERT INTO trade_history (order_id, data) VALUES (?1, ?2)
-                     ON CONFLICT(order_id) DO UPDATE SET data = excluded.data",
-                    params![record.order_id, json_val],
-                );
-            });
+            let conn = self.conn.lock().unwrap();
+            let _ = conn.execute(
+                "INSERT INTO trade_history (order_id, data) VALUES (?1, ?2)
+                 ON CONFLICT(order_id) DO UPDATE SET data = excluded.data",
+                params![record.order_id, json_val],
+            );
         }
     }
 
     pub fn delete_position(&self, condition_id: &str) {
-        tokio::task::block_in_place(|| {
-            let conn = self.conn.lock().unwrap();
-            let _ = conn.execute(
-                "DELETE FROM positions WHERE condition_id = ?1",
-                params![condition_id],
-            );
-        });
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "DELETE FROM positions WHERE condition_id = ?1",
+            params![condition_id],
+        );
     }
 
     pub fn load_all_positions(&self) -> HashMap<String, Position> {

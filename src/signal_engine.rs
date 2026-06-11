@@ -2,11 +2,10 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::sync::mpsc;
-use chrono::Utc;
 use std::time::SystemTime;
 
 use crate::config::Config;
-use crate::types::{Signal, Position, PriceTick, LiveState};
+use crate::types::{Signal, PriceTick, LiveState};
 use crate::oracle::OracleCache;
 use crate::orderbook_cache::OrderbookCache;
 use crate::scanner::Scanner;
@@ -51,7 +50,7 @@ pub async fn run_signal_engine(
     let mut last_clear_ts = SystemTime::now();
     let mut last_diag_ts = SystemTime::now();
     let mut last_escape_ts = SystemTime::now();
-    let mut dropped_signals = 0u64;
+    let mut _dropped_signals = 0u64;
     let mut dropped_hedges = 0u64;
     let mut active_subscriptions: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -137,9 +136,7 @@ pub async fn run_signal_engine(
                 if spot == 0.0 { continue; }
 
                 let mut breach = false;
-                if pos.side == "UP" && spot < pos.price_to_beat {
-                    breach = true;
-                } else if pos.side == "DOWN" && spot > pos.price_to_beat {
+                if (pos.side == "UP" && spot < pos.price_to_beat) || (pos.side == "DOWN" && spot > pos.price_to_beat) {
                     breach = true;
                 }
 
@@ -181,7 +178,6 @@ pub async fn run_signal_engine(
             if t_left_s <= 0.0 || t_left_s > engine.config.max_execution_time_seconds { continue; }
 
             let move_pct = (current_price - price_to_beat) / price_to_beat;
-            let target_gap_pct = engine.config.base_gap_bps / 100.0;
             let (correct_side, token_id, static_token_price) = if current_price >= price_to_beat {
                 ("UP", &market.up_token_id, market.up_price)
             } else {
@@ -190,10 +186,16 @@ pub async fn run_signal_engine(
 
             let current_capital = f64::from_bits(engine.atomic_capital.load(std::sync::atomic::Ordering::Acquire));
             let capital = if current_capital > engine.config.initial_capital { current_capital } else { engine.config.initial_capital };
-            let required_capital = capital * engine.config.max_position_size_pct;
+            let mut required_capital = capital * engine.config.max_position_size_pct;
+            if required_capital < engine.config.min_order_size_usd {
+                required_capital = engine.config.min_order_size_usd;
+            }
+            if required_capital > capital {
+                required_capital = capital;
+            }
             let approx_shares = required_capital / static_token_price;
 
-            let mut token_price = if let Some(sweep) = engine.orderbook.calculate_sweep_price(token_id, "BUY", approx_shares).await {
+            let token_price = if let Some(sweep) = engine.orderbook.calculate_sweep_price(token_id, "BUY", approx_shares).await {
                 if sweep > 0.0 && sweep < 1.0 { sweep } else { static_token_price }
             } else {
                 static_token_price
@@ -227,10 +229,12 @@ pub async fn run_signal_engine(
 
             let gap = current_price - price_to_beat;
             let decision_finished_at = std::time::Instant::now();
-            let mut lat = crate::types::LatencyMetrics::default();
-            lat.binance_tick_received_at = tick_received_at;
-            lat.signal_decision_started_at = decision_started_at;
-            lat.signal_decision_finished_at = decision_finished_at;
+            let lat = crate::types::LatencyMetrics {
+                binance_tick_received_at: tick_received_at,
+                signal_decision_started_at: decision_started_at,
+                signal_decision_finished_at: decision_finished_at,
+                ..Default::default()
+            };
 
             let signal = Signal {
                 condition_id: cid.clone(),
@@ -272,9 +276,9 @@ pub async fn run_signal_engine(
 
             // (Commented out to remove hot path blocking I/O)
             // println!("\n[SIGNAL] *** SIGNAL FIRED *** | {} | {} | token: ${:.4}", signal.symbol, signal.side, signal.entry_price);
-            if let Err(e) = queue.try_send(signal) {
-                dropped_signals += 1;
-                // println!("[SIGNAL] ⚠️ Trader queue full! Dropping signal to prevent backpressure (Total dropped: {}). Err: {}", dropped_signals, e);
+            if let Err(_e) = queue.try_send(signal) {
+                _dropped_signals += 1;
+                // println!("[SIGNAL] ⚠️ Trader queue full! Dropping signal to prevent backpressure (Total dropped: {}). Err: {}", _dropped_signals, _e);
             }
         }
     }

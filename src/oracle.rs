@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use serde::Deserialize;
+
 
 #[derive(Debug, Clone)]
 pub struct OracleEntry {
@@ -11,11 +11,7 @@ pub struct OracleEntry {
 
 pub type OracleCache = Arc<RwLock<HashMap<String, OracleEntry>>>;
 
-#[derive(Deserialize, Debug)]
-pub struct BinanceTicker {
-    pub symbol: String,
-    pub price: String,
-}
+
 
 pub async fn run_oracle(cache: OracleCache, tick_tx: tokio::sync::mpsc::Sender<crate::types::PriceTick>) {
     println!("[ORACLE] Oracle started. Initializing...");
@@ -56,11 +52,6 @@ pub async fn run_oracle(cache: OracleCache, tick_tx: tokio::sync::mpsc::Sender<c
     use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
     use futures_util::StreamExt;
     
-    #[derive(Deserialize)]
-    struct WsAggTrade {
-        s: String, // Symbol
-        p: String, // Price
-    }
 
     let ws_url = "wss://stream.binance.com:9443/ws/btcusdt@aggTrade/ethusdt@aggTrade/solusdt@aggTrade";
 

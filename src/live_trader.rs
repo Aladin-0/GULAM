@@ -1,3 +1,4 @@
+#![allow(unused_assignments)]
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::sync::mpsc;
@@ -45,7 +46,65 @@ impl LiveTrader {
         }
     }
 
+    pub fn get_auth_identity(&self) -> &str {
+        match self.config.auth_identity_mode.to_uppercase().as_str() {
+            "EOA" => &self.exec_ctx.eoa_signer_address,
+            _ => &self.exec_ctx.proxy_addr_str, // PROXY
+        }
+    }
+
+    pub fn get_order_identities(&self) -> (&str, &str, &str) {
+        // Returns (owner, maker, signer)
+        match self.config.order_identity_mode.to_uppercase().as_str() {
+            "EOA" => (&self.exec_ctx.eoa_signer_address, &self.exec_ctx.eoa_signer_address, &self.exec_ctx.eoa_signer_address),
+            "MIXED" => (&self.exec_ctx.proxy_addr_str, &self.exec_ctx.proxy_addr_str, &self.exec_ctx.eoa_signer_address), // Proxy is owner/maker, EOA is signer
+            _ => (&self.exec_ctx.proxy_addr_str, &self.exec_ctx.proxy_addr_str, &self.exec_ctx.proxy_addr_str), // PROXY
+        }
+    }
+
     pub async fn startup_checks(&self) {
+        println!("[STARTUP] EOA from PRIVATE_KEY: {}", self.exec_ctx.eoa_signer_address);
+        println!("[STARTUP] proxy/deposit wallet: {}", self.exec_ctx.proxy_addr_str);
+        println!("[STARTUP] POLY_ADDRESS actually used in every request: {} (Mode: {})", self.get_auth_identity(), self.config.auth_identity_mode);
+        println!("[STARTUP] signature type: {}", self.config.polymarket_sig_type);
+        println!("[STARTUP] order identity mode: {}", self.config.order_identity_mode);
+
+        if !self.config.paper_trading {
+            if self.exec_ctx.creds.api_key.is_empty() || self.exec_ctx.creds.api_secret.is_empty() {
+                eprintln!("[FATAL] Live trading is enabled but API credentials are missing. Aborting.");
+                std::process::exit(1);
+            }
+            if self.exec_ctx.api_secret_bytes.len() != 32 {
+                eprintln!("[FATAL] Decoded API secret length is not 32 bytes (got {}). Aborting.", self.exec_ctx.api_secret_bytes.len());
+                std::process::exit(1);
+            }
+
+            let auth_url = format!("{}/auth/api-key", self.config.polymarket_host);
+            let headers = generate_level_1_headers("GET", "/auth/api-key", "", &self.exec_ctx.creds, self.get_auth_identity(), &self.exec_ctx.api_secret_bytes);
+            
+            let mut identity_found = false;
+            if let Ok(res) = self.client.get(&auth_url).headers(headers).send().await {
+                if let Ok(json) = res.json::<serde_json::Value>().await {
+                    println!("[STARTUP] API key check response: {:?}", json);
+                    if let Some(poly_address) = json.get("polyAddress").and_then(|v| v.as_str())
+                        .or_else(|| json.get("address").and_then(|v| v.as_str()))
+                        .or_else(|| json.get("wallet").and_then(|v| v.as_str())) 
+                    {
+                        identity_found = true;
+                        println!("[STARTUP] API key identity retrieved: {}", poly_address);
+                        if poly_address.to_lowercase() != self.get_auth_identity().to_lowercase() {
+                            eprintln!("[FATAL] Mismatch! API key is bound to {} but current auth identity is {}. Aborting.", poly_address, self.get_auth_identity());
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+
+            if !identity_found {
+                println!("[STARTUP] ⚠️ API key wallet identity could not be queried; current auth identity is {}. If order submission still fails with signer/API-key mismatch, regenerate API credentials from this exact wallet.", self.get_auth_identity());
+            }
+        }
+
         if self.config.paper_trading {
             println!("[TRADER] 📝 PAPER TRADING: Skipping real balance sync. Using initial capital.");
             return;
@@ -55,7 +114,7 @@ impl LiveTrader {
     }
 
     pub async fn sync_live_balance(&self) {
-        let headers = generate_level_1_headers("GET", "/balance-allowance", "", &self.exec_ctx.creds, &self.exec_ctx.eoa_signer_address, &self.exec_ctx.api_secret_bytes);
+        let headers = generate_level_1_headers("GET", "/balance-allowance", "", &self.exec_ctx.creds, self.get_auth_identity(), &self.exec_ctx.api_secret_bytes);
         let url = format!("{}/balance-allowance?asset_type=COLLATERAL&signature_type={}", self.config.polymarket_host, self.config.polymarket_sig_type);
         
         if let Ok(res) = self.client.get(&url).headers(headers).send().await {
@@ -82,7 +141,7 @@ impl LiveTrader {
     }
 
     pub async fn process_signal(&self, signal: Signal) {
-        let (mut available, mut total_equity) = {
+        let (available, total_equity) = {
             let state = self.live_state.read().await;
             let reserved: f64 = state.open_positions.values().map(|p| p.cost).sum();
             (state.available_capital, state.available_capital + reserved)
@@ -119,69 +178,120 @@ impl LiveTrader {
         let salt = ethers::types::U256::from(Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64);
         let order_timestamp = ethers::types::U256::from(Utc::now().timestamp());
 
-        let mut order_abi = self.exec_ctx.order_abi_template;
+        // --- EIP-712 Struct Hash ---
+        // Layout (12 slots × 32 bytes = 384 bytes):
+        // [0]  ORDER_TYPEHASH
+        // [1]  salt          (uint256)
+        // [2]  maker         (address, padded to 32)
+        // [3]  signer        (address, padded to 32)
+        // [4]  tokenId       (uint256)
+        // [5]  makerAmount   (uint256)
+        // [6]  takerAmount   (uint256)
+        // [7]  side          (uint8 = 0 for BUY)
+        // [8]  signatureType (uint8)
+        // [9]  timestamp     (uint256)
+        // [10] metadata      (bytes32 = all zeros)
+        // [11] builder       (bytes32 = all zeros)
+        let mut order_abi = [0u8; 384];
+        order_abi[0..32].copy_from_slice(&self.exec_ctx.order_typehash);
         salt.to_big_endian(&mut order_abi[32..64]);
+        
+        let (_order_owner, order_maker, order_signer) = self.get_order_identities();
+        
+        let maker_bytes = hex::decode(order_maker.trim_start_matches("0x")).unwrap_or_default();
+        let signer_bytes = hex::decode(order_signer.trim_start_matches("0x")).unwrap_or_default();
+        if maker_bytes.len() == 20 && signer_bytes.len() == 20 {
+            order_abi[44..64].copy_from_slice(&maker_bytes); // maker
+            order_abi[76..96].copy_from_slice(&signer_bytes); // signer
+        }
         let token_id_u256 = ethers::types::U256::from_str_radix(&signal.token_id, 10).unwrap_or_default();
         token_id_u256.to_big_endian(&mut order_abi[128..160]);
         ethers::types::U256::from(maker_amount).to_big_endian(&mut order_abi[160..192]);
         ethers::types::U256::from(taker_amount).to_big_endian(&mut order_abi[192..224]);
+        // side = 0 (BUY), signatureType = config value — both uint8 in 32-byte slots
+        order_abi[255] = 0u8; // side = 0 = BUY
+        order_abi[287] = self.config.polymarket_sig_type as u8; // signatureType
         order_timestamp.to_big_endian(&mut order_abi[288..320]);
-        
+        // metadata [320..352] and builder [352..384] are already zero
+
         let struct_hash = ethers::utils::keccak256(order_abi);
 
-        let mut solady_abi = self.exec_ctx.solady_abi_template;
-        solady_abi[32..64].copy_from_slice(&struct_hash);
-        let typed_data_sign_struct_hash = ethers::utils::keccak256(solady_abi);
-        
-        let mut digest_input = [0u8; 66];
-        digest_input[0] = 0x19;
-        digest_input[1] = 0x01;
-        digest_input[2..34].copy_from_slice(&self.exec_ctx.domain_separator);
-        digest_input[34..66].copy_from_slice(&typed_data_sign_struct_hash);
-        
-        let digest = ethers::utils::keccak256(digest_input);
-        let signature = self.exec_ctx.wallet.sign_hash(digest.into()).expect("Failed to sign digest");
-        let mut signature_bytes = signature.to_vec();
-        
-        let mut final_signature = String::with_capacity(634);
-        final_signature.push_str("0x");
-        const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
-        for &b in &signature_bytes {
-            final_signature.push(HEX_CHARS[(b >> 4) as usize] as char);
-            final_signature.push(HEX_CHARS[(b & 0x0F) as usize] as char);
-        }
-        for &b in &self.exec_ctx.domain_separator {
-            final_signature.push(HEX_CHARS[(b >> 4) as usize] as char);
-            final_signature.push(HEX_CHARS[(b & 0x0F) as usize] as char);
-        }
-        for &b in &struct_hash {
-            final_signature.push(HEX_CHARS[(b >> 4) as usize] as char);
-            final_signature.push(HEX_CHARS[(b & 0x0F) as usize] as char);
-        }
-        let order_type_string = b"Order(uint256 salt,address maker,address signer,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,uint256 timestamp,bytes32 metadata,bytes32 builder)";
-        for &b in order_type_string {
-            final_signature.push(HEX_CHARS[(b >> 4) as usize] as char);
-            final_signature.push(HEX_CHARS[(b & 0x0F) as usize] as char);
-        }
-        let len_u16 = order_type_string.len() as u16;
-        for &b in &len_u16.to_be_bytes() {
-            final_signature.push(HEX_CHARS[(b >> 4) as usize] as char);
-            final_signature.push(HEX_CHARS[(b & 0x0F) as usize] as char);
+        let mut final_signature = String::new();
+
+        if self.config.polymarket_sig_type == 3 {
+            // EIP-7739 POLY_1271 Deposit Wallet Proxy Signature
+            let mut solady_abi = [0u8; 224]; // 7 slots * 32 bytes
+            solady_abi[0..32].copy_from_slice(&crate::execution::SOLADY_TYPE_HASH);
+            solady_abi[32..64].copy_from_slice(&struct_hash); // contents_hash
+            solady_abi[64..96].copy_from_slice(&crate::execution::DEPOSIT_WALLET_NAME_HASH);
+            solady_abi[96..128].copy_from_slice(&crate::execution::DEPOSIT_WALLET_VERSION_HASH);
+            ethers::types::U256::from(137).to_big_endian(&mut solady_abi[128..160]); // chain_id
+            let signer_bytes = hex::decode(order_signer.trim_start_matches("0x")).unwrap_or_default();
+            solady_abi[172..192].copy_from_slice(&signer_bytes); // signer address padded to 32
+            // [192..224] is DEPOSIT_WALLET_DOMAIN_SALT (all zeros)
+
+            let typed_data_sign_struct_hash = ethers::utils::keccak256(solady_abi);
+
+            let mut digest_input = [0u8; 66];
+            digest_input[0] = 0x19;
+            digest_input[1] = 0x01;
+            digest_input[2..34].copy_from_slice(&self.exec_ctx.domain_separator); // app_domain_separator
+            digest_input[34..66].copy_from_slice(&typed_data_sign_struct_hash);
+
+            let digest = ethers::utils::keccak256(digest_input);
+            let signature = self.exec_ctx.wallet.sign_hash(digest.into()).expect("Failed to sign digest");
+            
+            // Reconstruct Solady wrapper suffix
+            let mut inner_sig = signature.to_vec();
+            if inner_sig[64] < 27 { inner_sig[64] += 27; } // POLY_1271 requires 27/28
+
+            let mut suffix = String::new();
+            suffix.push_str("0x");
+            suffix.push_str(&hex::encode(&inner_sig));
+            suffix.push_str(&hex::encode(self.exec_ctx.domain_separator));
+            suffix.push_str(&hex::encode(struct_hash));
+            
+            let order_type_string = "Order(uint256 salt,address maker,address signer,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,uint256 timestamp,bytes32 metadata,bytes32 builder)";
+            suffix.push_str(&hex::encode(order_type_string.as_bytes()));
+            let str_len = order_type_string.len() as u16;
+            suffix.push_str(&hex::encode(str_len.to_be_bytes()));
+            
+            final_signature = suffix;
+        } else {
+            // Standard EIP-712 EOA Signature
+            let mut digest_input = [0u8; 66];
+            digest_input[0] = 0x19;
+            digest_input[1] = 0x01;
+            digest_input[2..34].copy_from_slice(&self.exec_ctx.domain_separator);
+            digest_input[34..66].copy_from_slice(&struct_hash);
+
+            let digest = ethers::utils::keccak256(digest_input);
+            let signature = self.exec_ctx.wallet.sign_hash(digest.into()).expect("Failed to sign digest");
+            let signature_bytes = signature.to_vec();
+
+            final_signature.push_str("0x");
+            const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+            for &b in &signature_bytes {
+                final_signature.push(HEX_CHARS[(b >> 4) as usize] as char);
+                final_signature.push(HEX_CHARS[(b & 0x0F) as usize] as char);
+            }
         }
 
         let expiration = Utc::now().timestamp() + 5;
+        let order_ts_u64 = order_timestamp.as_u64();
+        let salt_u64 = salt.low_u64();
         let json_body = format!(
             r#"{{"owner":"{}","order":{{"salt":{},"maker":"{}","signer":"{}","tokenId":"{}","makerAmount":"{}","takerAmount":"{}","side":"BUY","expiration":"{}","signatureType":{},"timestamp":"{}","metadata":"0x0000000000000000000000000000000000000000000000000000000000000000","builder":"0x0000000000000000000000000000000000000000000000000000000000000000","signature":"{}"}},"orderType":"GTC","deferExec":false,"postOnly":false}}"#,
-            self.config.polymarket_proxy_wallet,
-            salt.low_u64(),
-            self.exec_ctx.proxy_addr_str,
-            self.exec_ctx.proxy_addr_str,
+            self.exec_ctx.creds.api_key,
+            salt_u64,
+            order_maker,
+            order_signer,
             signal.token_id,
             maker_amount,
             taker_amount,
             expiration,
             self.config.polymarket_sig_type,
-            order_timestamp,
+            order_ts_u64,
             final_signature
         );
         
@@ -193,8 +303,8 @@ impl LiveTrader {
 
         let mut order_id = String::new();
         let mut filled = false;
-        let mut fill_price = order_price;
-        let mut fill_shares = shares;
+        let fill_price = order_price;
+        let fill_shares = shares;
 
         if self.config.paper_trading {
             if let Some(ref mut lat) = signal_mut.latency {
@@ -207,7 +317,8 @@ impl LiveTrader {
             filled = true;
         } else {
             let url = format!("{}/order", self.config.polymarket_host);
-            let headers = generate_level_1_headers("POST", "/order", &json_body, &self.exec_ctx.creds, &self.exec_ctx.eoa_signer_address, &self.exec_ctx.api_secret_bytes);
+            let headers = generate_level_1_headers("POST", "/order", &json_body, &self.exec_ctx.creds, self.get_auth_identity(), &self.exec_ctx.api_secret_bytes);
+            println!("[TRADER] Final Payload (BUY) -> Maker: {}, Signer: {}, POLY_ADDRESS: {}", order_maker, order_signer, self.get_auth_identity());
             let post_result = self.client.post(&url).headers(headers).body(json_body).send().await;
             
             if let Some(ref mut lat) = signal_mut.latency {
@@ -215,17 +326,27 @@ impl LiveTrader {
             }
 
             if let Ok(res) = post_result {
-                if let Ok(json) = res.json::<serde_json::Value>().await {
-                    if let Some(oid) = json.get("orderID").and_then(|v| v.as_str()) {
-                        order_id = oid.to_string();
-                    } else if let Some(oid) = json.get("orderId").and_then(|v| v.as_str()) {
-                        order_id = oid.to_string();
+                let status = res.status();
+                match res.json::<serde_json::Value>().await {
+                    Ok(json) => {
+                        if let Some(oid) = json.get("orderID").and_then(|v| v.as_str()) {
+                            order_id = oid.to_string();
+                        } else if let Some(oid) = json.get("orderId").and_then(|v| v.as_str()) {
+                            order_id = oid.to_string();
+                        } else {
+                            println!("[TRADER] ❌ Polymarket rejected order (HTTP {}): {}", status, json);
+                        }
+                    }
+                    Err(e) => {
+                        println!("[TRADER] ❌ Failed to parse Polymarket response (HTTP {}): {}", status, e);
                     }
                 }
+            } else if let Err(e) = post_result {
+                println!("[TRADER] ❌ HTTP send error: {}", e);
             }
 
             if order_id.is_empty() {
-                println!("[TRADER] 🚫 Order submission failed or no orderID returned. Aborting.");
+                println!("[TRADER] 🚫 Order submission failed. Aborting.");
                 return;
             }
 
@@ -313,8 +434,8 @@ impl LiveTrader {
 
             let mut order_id = format!("hedge_order_{}", Utc::now().timestamp());
             let mut filled = false;
-            let mut fill_price = exit_price;
-            let fill_shares = pos.shares;
+            let fill_price = exit_price;
+            let _fill_shares = pos.shares;
 
             if self.config.paper_trading {
                 println!("[TRADER] 📝 PAPER TRADING: Simulating instant fill for {} shares of {} at ${:.4} (SELL)", pos.shares, pos.symbol, exit_price);
@@ -326,61 +447,51 @@ impl LiveTrader {
                 let salt = ethers::types::U256::from(Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64);
                 let order_timestamp = ethers::types::U256::from(Utc::now().timestamp());
 
-                let mut order_abi = self.exec_ctx.order_abi_template;
+                let (_order_owner, order_maker, order_signer) = self.get_order_identities();
+
+                // EIP-712 struct hash for SELL order
+                let mut order_abi = [0u8; 384];
+                order_abi[0..32].copy_from_slice(&self.exec_ctx.order_typehash);
                 salt.to_big_endian(&mut order_abi[32..64]);
+                
+                let maker_bytes = hex::decode(order_maker.trim_start_matches("0x")).unwrap_or_default();
+                let signer_bytes = hex::decode(order_signer.trim_start_matches("0x")).unwrap_or_default();
+                if maker_bytes.len() == 20 && signer_bytes.len() == 20 {
+                    order_abi[44..64].copy_from_slice(&maker_bytes);
+                    order_abi[76..96].copy_from_slice(&signer_bytes);
+                }
                 let token_id_u256 = ethers::types::U256::from_str_radix(&pos.token_id, 10).unwrap_or_default();
                 token_id_u256.to_big_endian(&mut order_abi[128..160]);
                 ethers::types::U256::from(maker_amount).to_big_endian(&mut order_abi[160..192]);
                 ethers::types::U256::from(taker_amount).to_big_endian(&mut order_abi[192..224]);
-                ethers::types::U256::from(1).to_big_endian(&mut order_abi[224..256]); // SELL is 1
+                order_abi[255] = 1u8; // side = 1 = SELL
+                order_abi[287] = self.config.polymarket_sig_type as u8;
                 order_timestamp.to_big_endian(&mut order_abi[288..320]);
-                
+
                 let struct_hash = ethers::utils::keccak256(order_abi);
 
-                let mut solady_abi = self.exec_ctx.solady_abi_template;
-                solady_abi[32..64].copy_from_slice(&struct_hash);
-                let typed_data_sign_struct_hash = ethers::utils::keccak256(solady_abi);
-                
                 let mut digest_input = [0u8; 66];
                 digest_input[0] = 0x19;
                 digest_input[1] = 0x01;
                 digest_input[2..34].copy_from_slice(&self.exec_ctx.domain_separator);
-                digest_input[34..66].copy_from_slice(&typed_data_sign_struct_hash);
-                
+                digest_input[34..66].copy_from_slice(&struct_hash);
+
                 let digest = ethers::utils::keccak256(digest_input);
                 let signature = self.exec_ctx.wallet.sign_hash(digest.into()).expect("Failed to sign digest");
                 let signature_bytes = signature.to_vec();
-                
-                let mut final_signature = String::with_capacity(634);
+
+                let mut final_signature = String::with_capacity(132);
                 final_signature.push_str("0x");
                 const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
                 for &b in &signature_bytes {
                     final_signature.push(HEX_CHARS[(b >> 4) as usize] as char);
                     final_signature.push(HEX_CHARS[(b & 0x0F) as usize] as char);
                 }
-                for &b in &self.exec_ctx.domain_separator {
-                    final_signature.push(HEX_CHARS[(b >> 4) as usize] as char);
-                    final_signature.push(HEX_CHARS[(b & 0x0F) as usize] as char);
-                }
-                for &b in &struct_hash {
-                    final_signature.push(HEX_CHARS[(b >> 4) as usize] as char);
-                    final_signature.push(HEX_CHARS[(b & 0x0F) as usize] as char);
-                }
-                let order_type_string = b"Order(uint256 salt,address maker,address signer,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,uint256 timestamp,bytes32 metadata,bytes32 builder)";
-                for &b in order_type_string {
-                    final_signature.push(HEX_CHARS[(b >> 4) as usize] as char);
-                    final_signature.push(HEX_CHARS[(b & 0x0F) as usize] as char);
-                }
-                let len_u16 = order_type_string.len() as u16;
-                for &b in &len_u16.to_be_bytes() {
-                    final_signature.push(HEX_CHARS[(b >> 4) as usize] as char);
-                    final_signature.push(HEX_CHARS[(b & 0x0F) as usize] as char);
-                }
 
                 let order_struct = serde_json::json!({
                     "salt": salt.low_u64(),
-                    "maker": self.exec_ctx.proxy_addr_str,
-                    "signer": self.exec_ctx.proxy_addr_str,
+                    "maker": order_maker,
+                    "signer": order_signer,
                     "tokenId": pos.token_id,
                     "makerAmount": maker_amount.to_string(),
                     "takerAmount": taker_amount.to_string(),
@@ -394,7 +505,7 @@ impl LiveTrader {
                 });
 
                 let final_payload = serde_json::json!({
-                    "owner": self.config.polymarket_proxy_wallet,
+                    "owner": self.exec_ctx.creds.api_key,
                     "order": order_struct,
                     "orderType": "GTC",
                     "deferExec": false,
@@ -405,7 +516,8 @@ impl LiveTrader {
                 let url = format!("{}/order", self.config.polymarket_host);
                 
                 let post_result = {
-                    let headers = generate_level_1_headers("POST", "/order", &json_body, &self.exec_ctx.creds, &self.exec_ctx.eoa_signer_address, &self.exec_ctx.api_secret_bytes);
+                    let headers = generate_level_1_headers("POST", "/order", &json_body, &self.exec_ctx.creds, self.get_auth_identity(), &self.exec_ctx.api_secret_bytes);
+                    println!("[TRADER] Final Payload (SELL) -> Maker: {}, Signer: {}, POLY_ADDRESS: {}", order_maker, order_signer, self.get_auth_identity());
                     self.client.post(&url).headers(headers).body(json_body).send().await
                 };
 
@@ -522,7 +634,7 @@ impl LiveTrader {
 
                         // 1. Check Trade API (Order Status)
                         let path = format!("/order/{}", pos.order_id);
-                        let headers = generate_level_1_headers("GET", &path, "", &self.exec_ctx.creds, &self.exec_ctx.eoa_signer_address, &self.exec_ctx.api_secret_bytes);
+                        let headers = generate_level_1_headers("GET", &path, "", &self.exec_ctx.creds, self.get_auth_identity(), &self.exec_ctx.api_secret_bytes);
                         let url = format!("{}{}", self.config.polymarket_host, path);
                         
                         if let Ok(res) = self.client.get(&url).headers(headers).send().await {
@@ -775,7 +887,7 @@ impl LiveTrader {
         for (oid, sub_time) in pending_ids {
             if now - sub_time > 6.0 {
                 let path = format!("/order/{}", oid);
-                let headers = generate_level_1_headers("GET", &path, "", &self.exec_ctx.creds, &self.exec_ctx.eoa_signer_address, &self.exec_ctx.api_secret_bytes);
+                let headers = generate_level_1_headers("GET", &path, "", &self.exec_ctx.creds, self.get_auth_identity(), &self.exec_ctx.api_secret_bytes);
                 let url = format!("{}{}", self.config.polymarket_host, path);
                 
                 if let Ok(res) = self.client.get(&url).headers(headers).send().await {
@@ -803,7 +915,7 @@ impl LiveTrader {
         for (oid, sub_time) in pending_hedge_ids {
             if now - sub_time > 6.0 {
                 let path = format!("/order/{}", oid);
-                let headers = generate_level_1_headers("GET", &path, "", &self.exec_ctx.creds, &self.exec_ctx.eoa_signer_address, &self.exec_ctx.api_secret_bytes);
+                let headers = generate_level_1_headers("GET", &path, "", &self.exec_ctx.creds, self.get_auth_identity(), &self.exec_ctx.api_secret_bytes);
                 let url = format!("{}{}", self.config.polymarket_host, path);
                 
                 if let Ok(res) = self.client.get(&url).headers(headers).send().await {
@@ -852,6 +964,8 @@ impl LiveTrader {
                 signal.symbol, decision_us, order_build_us, http_ack_us, ack_to_fill_us, total_us);
         }
     }
+
+
 }
 
 pub async fn run_user_ws_fill_processor(trader: Arc<LiveTrader>, mut user_ws_rx: mpsc::Receiver<crate::types::UserWsMessage>) {

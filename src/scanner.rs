@@ -60,9 +60,6 @@ impl Scanner {
         });
     }
 
-    pub async fn get_market_count(&self) -> usize {
-        self.markets.read().await.len()
-    }
 }
 
 /// Compute the Unix timestamp of the current 15-minute slot boundary (floor).
@@ -179,7 +176,7 @@ pub async fn run_scanner(scanner: Scanner) {
 
             // Parse outcome prices
             let prices: Vec<String> = serde_json::from_str(&raw.outcome_prices).unwrap_or_default();
-            let up_p: f64 = prices.get(0).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let up_p: f64 = prices.first().and_then(|s| s.parse().ok()).unwrap_or(0.0);
             let down_p: f64 = prices.get(1).and_then(|s| s.parse().ok()).unwrap_or(0.0);
 
             let symbol = match asset.as_str() {
@@ -210,7 +207,7 @@ pub async fn run_scanner(scanner: Scanner) {
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         }
 
-        let count = new_map.len();
+
         {
             let mut r = scanner.markets.write().await;
             if !scan_failed {

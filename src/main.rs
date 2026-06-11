@@ -90,7 +90,6 @@ async fn main() {
         atomic_capital.clone(),
     ));
 
-
     // Spawn Supervised Tasks
     let oc = oracle_cache.clone();
     let oracle_tick_tx = tick_tx.clone();
