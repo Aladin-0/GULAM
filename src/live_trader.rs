@@ -277,7 +277,7 @@ impl LiveTrader {
             }
         }
 
-        let expiration = Utc::now().timestamp() + 5;
+        let expiration = "0";
         let order_ts_u64 = order_timestamp.as_u64();
         let salt_u64 = salt.low_u64();
         let json_body = format!(
@@ -496,7 +496,7 @@ impl LiveTrader {
                     "makerAmount": maker_amount.to_string(),
                     "takerAmount": taker_amount.to_string(),
                     "side": "SELL",
-                    "expiration": (Utc::now().timestamp() + 5).to_string(),
+                    "expiration": "0",
                     "signatureType": self.config.polymarket_sig_type,
                     "timestamp": order_timestamp.to_string(),
                     "metadata": "0x0000000000000000000000000000000000000000000000000000000000000000",
