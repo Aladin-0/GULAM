@@ -22,6 +22,25 @@ use crate::signal_engine::{SignalEngine, run_signal_engine};
 use crate::live_trader::{LiveTrader, run_live_trader, run_user_ws_fill_processor};
 use crate::user_ws::run_user_ws;
 
+async fn run_whale_radar(funding_rate: Arc<RwLock<f64>>) {
+    let client = reqwest::Client::new();
+    loop {
+        match client.get("https://fapi.binance.com/fapi/v1/premiumIndex?symbol=BTCUSDT").send().await {
+            Ok(resp) => {
+                if let Ok(json) = resp.json::<serde_json::Value>().await {
+                    if let Some(rate_str) = json.get("lastFundingRate").and_then(|v| v.as_str()) {
+                        if let Ok(rate) = rate_str.parse::<f64>() {
+                            *funding_rate.write().await = rate * 100.0;
+                        }
+                    }
+                }
+            }
+            Err(e) => eprintln!("[MAIN] ⚠️ Whale Radar Error: {}", e),
+        }
+        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+    }
+}
+
 async fn supervised_task<F, Fut>(name: &'static str, f: F)
 where
     F: Fn() -> Fut + Send + Sync + 'static,
@@ -73,12 +92,19 @@ async fn main() {
     let (orderbook_cache, ob_sub_rx) = OrderbookCache::new();
     let scanner = Scanner::new();
     
+    let whale_funding_rate = Arc::new(RwLock::new(0.0));
+    let wfr_clone = whale_funding_rate.clone();
+    tokio::spawn(async move {
+        run_whale_radar(wfr_clone).await;
+    });
+
     let signal_engine = SignalEngine::new(
         config.clone(),
         oracle_cache.clone(),
         orderbook_cache.clone(),
         scanner.clone(),
         atomic_capital.clone(),
+        whale_funding_rate.clone(),
     );
 
     let live_trader = Arc::new(LiveTrader::new(
